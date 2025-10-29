@@ -1,291 +1,713 @@
+"""Utilities for evaluating vector resonant relaxation interaction terms.
+
+The module provides three complementary evaluators that cover the most
+commonly encountered orbital configurations (circular/circular,
+non-overlapping eccentric, overlapping eccentric and mixed
+configurations).  Each evaluator can return the interaction Hamiltonian,
+its associated precession frequency ``Omega`` and the torque acting on
+an orbit.  The evaluators operate on :class:`OrbitPair` instances, but
+they also accept batches of pairs so that large ensembles can be handled
+efficiently.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional, Sequence
+
 import numpy as np
 import scipy.special as sp
-import warnings
-from mpmath import quad, legendre 
-
-from scipy.integrate import dblquad, nquad, odeint
-
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-
-from loguru import logger
+from scipy.integrate import quad
 
 
-def P_l(l, x):
-    """
-    Return P_l(x), the standard Legendre polynomial of degree l.
-    Assumes l is an integer ≥ 0.  If l is odd and you know it should vanish,
-    you will get exactly zero (within numerical precision).
-    """
-    return sp.lpmv(0, l, x)
+# ---------------------------------------------------------------------------
+# Orbit and pair helpers
+# ---------------------------------------------------------------------------
 
 
-def P_l_prime(l, x):
-    """
-    Return d/dx [P_l(x)].  Formula:
-      P_l'(x) = - (l/(sqrt(1 - x^2))) P_l^1(x).
-    We use the associated Legendre function P_l^1(x) = l x P_l(x)/(sqrt(1-x^2)) - (l(l-1) P_{l-2}(x))/(sqrt(1-x^2)), 
-    but the simplest is sp.lpmv(1,l,x)/sqrt(1-x^2) with the correct sign.
-    """
-    # Handle x = ±1 safely:
-    if abs(x) == 1.0:
-        return 0.0
-    else:
-        return -sp.lpmv(1, l, x) / np.sqrt(1 - x**2)
+@dataclass(frozen=True)
+class Orbit:
+    """Simple container for Keplerian orbital elements."""
+
+    a: float
+    e: float
+    m: float
+
+    def __post_init__(self) -> None:
+        """Validate the provided orbital elements."""
+
+        if self.a <= 0:
+            raise ValueError("The semi-major axis must be positive.")
+        if not (0.0 <= self.e < 1.0):
+            raise ValueError("The eccentricity must lie within [0, 1).")
+        if self.m <= 0:
+            raise ValueError("The mass must be positive.")
+
+    @property
+    def b(self) -> float:
+        """Semi-minor axis ``b = a sqrt(1 - e^2)``."""
+
+        return self.a * np.sqrt(max(1.0 - self.e * self.e, 0.0))
+
+    @property
+    def periapsis(self) -> float:
+        """Periapsis distance ``r_p = a (1 - e)``."""
+
+        return self.a * (1.0 - self.e)
+
+    @property
+    def apoapsis(self) -> float:
+        """Apoapsis distance ``r_a = a (1 + e)``."""
+
+        return self.a * (1.0 + self.e)
+
+    @property
+    def chi(self) -> float:
+        """Axis ratio ``chi = a / b`` used by the asymptotic kernels."""
+
+        # Guard against b -> 0 in the very eccentric limit.
+        b = max(self.b, 1.0e-300)
+        return self.a / b
 
 
-def P_l_at_zero(l):
-    """
-    Compute P_l(0).  For even l=2k, P_{2k}(0) = (-1)^k * ( (2k)! / [2^(2k) (k!)^2 ] ).  
-    If l is odd, this returns 0 automatically.
-    We do everything in log‐space to avoid overflow.
-    """
-    if (l % 2) == 1:
-        return 0.0
+@dataclass
+class OrbitPair:
+    """Container describing two interacting stellar orbits."""
 
-    k = l // 2
-    log_gamma_2k = sp.gammaln(2*k + 1)
-    log_gamma_k  = sp.gammaln(k + 1)
-    log_val = log_gamma_2k - (2*k)*np.log(2) - 2*log_gamma_k
-    return ((-1)**k) * np.exp(log_val)
+    primary: Orbit
+    secondary: Orbit
+    cos_inclination: float
+    G: float = 1.0
+    M_central: float = 1.0
 
+    def __post_init__(self) -> None:
+        """Validate inputs and pre-compute helper state."""
 
-def s_ijl(a_i, a_j, e_i, e_j, l):
-    """
-    Compute s_{ij}^l for orbits i,j at eccentricities e_i,e_j 
-    and semimajor axes a_i,a_j.  Here l is the *actual* Legendre index.
-    We assume l is even (if l is odd, s_{ij}^l should vanish).
-    """
-    # If both e=0, s_{ij}^l = 1 for any l:
-    if (e_i == 0) and (e_j == 0):
+        self.cos_inclination = float(np.clip(self.cos_inclination, -1.0, 1.0))
+        if self.G <= 0:
+            raise ValueError("The gravitational constant must be positive.")
+        if self.M_central <= 0:
+            raise ValueError("The central mass must be positive.")
+
+        if self.primary.a <= self.secondary.a:
+            self._inner = self.primary
+            self._outer = self.secondary
+            self._primary_is_inner = True
+        else:
+            self._inner = self.secondary
+            self._outer = self.primary
+            self._primary_is_inner = False
+
+    # ------------------------------------------------------------------
+    # Convenience properties
+    # ------------------------------------------------------------------
+    @property
+    def inner(self) -> Orbit:
+        """Return the orbit with the smaller semi-major axis."""
+
+        return self._inner
+
+    @property
+    def outer(self) -> Orbit:
+        """Return the orbit with the larger semi-major axis."""
+
+        return self._outer
+
+    @property
+    def primary_is_inner(self) -> bool:
+        """Indicate whether the primary orbit is the inner orbit."""
+
+        return self._primary_is_inner
+
+    @property
+    def mutual_inclination(self) -> float:
+        """Return the mutual inclination in radians."""
+
+        return float(np.arccos(self.cos_inclination))
+
+    @property
+    def sin_inclination(self) -> float:
+        """Return ``sin(i)`` for the mutual inclination angle ``i``."""
+
+        return float(np.sqrt(max(1.0 - self.cos_inclination ** 2, 0.0)))
+
+    @property
+    def non_overlapping(self) -> bool:
+        """Return ``True`` if the orbital annuli do not overlap."""
+
+        inner, outer = self.inner, self.outer
+        return inner.apoapsis < outer.periapsis
+
+    @property
+    def z_parameter(self) -> float:
+        """Return the ratio ``z = r_a,in / r_p,out`` for non-overlapping orbits."""
+
+        if self.non_overlapping:
+            inner, outer = self.inner, self.outer
+            return inner.apoapsis / outer.periapsis
         return 1.0
 
-    # Determine which orbit is inner vs outer:
-    if a_i < a_j:
-        a_in,  a_out  = a_i,  a_j
-        e_in,  e_out  = e_i,  e_j
-    else:
-        a_in,  a_out  = a_j,  a_i
-        e_in,  e_out  = e_j,  e_i
+    @property
+    def semi_major_ratio(self) -> float:
+        """Return the semi-major-axis ratio ``alpha = a_in / a_out``."""
 
-    chi_in  = 1.0 / np.sqrt(1 - e_in**2)
-    chi_out = 1.0 / np.sqrt(1 - e_out**2)
+        return self.inner.a / self.outer.a
 
-    # NON‐OVERLAPPING CASE:  a_in*(1 + e_in) < a_out*(1 - e_out)
-    if a_in * (1 + e_in) < a_out * (1 - e_out):
-        # Exactly: s_{ij}^l = (chi_out^l / chi_in^{l+1}) * P_{l+1}(chi_in) * P_l(-chi_out)
-        P_lp1_in = P_l(l+1,  chi_in)    # P_{l+1}(chi_in)
-        P_l_out  = P_l(l,    -chi_out)  # P_{l} (-chi_out)
-        return (chi_out**l / chi_in**(l+1)) * P_lp1_in * P_l_out
+    @property
+    def circular_configuration(self) -> Optional[str]:
+        """Return a tag describing whether any orbit is circular."""
 
-    # OVERLAPPING CASE: do the 2D integral via Gauss–Legendre
-    else:
-        return compute_integral_gauss(e_in, e_out, l, a_in, a_out)
+        inner, outer = self.inner, self.outer
+        if inner.e == 0.0 and outer.e == 0.0:
+            return "both"
+        if inner.e == 0.0 and outer.e > 0.0:
+            return "inner"
+        if outer.e == 0.0 and inner.e > 0.0:
+            return "outer"
+        return None
 
+    @property
+    def angular_momentum_primary(self) -> float:
+        """Return the magnitude of the primary orbit's angular momentum."""
 
-def compute_integral_gauss(e_in, e_out, l, a_in, a_out, N=100):
-    """
-    Double integral for s_{ij}^l when orbits overlap. l is the *actual* Legendre index.
-    """
-    alpha = a_in / a_out
-    c     = 1.0 / alpha  # = a_out/a_in
+        orb = self.primary
+        return orb.m * np.sqrt(
+            self.G * self.M_central * orb.a * max(1.0 - orb.e ** 2, 0.0)
+        )
 
-    # 1) Gauss–Legendre nodes & weights on [0, π] for phi_in
-    nodes_in, weights_in = np.polynomial.legendre.leggauss(N)
-    phi_in  = 0.5*(nodes_in + 1)*np.pi
-    w_in    = 0.5*np.pi*weights_in
+    @property
+    def orbital_frequency_primary(self) -> float:
+        """Return the Keplerian orbital frequency of the primary orbit."""
 
-    # 2) Gauss–Legendre nodes & weights on [0, π] for phi_out
-    nodes_out, weights_out = np.polynomial.legendre.leggauss(N)
-    phi_out = 0.5*(nodes_out + 1)*np.pi
-    w_out   = 0.5*np.pi*weights_out
-
-    # 3) Build X = (1 + e_in cos(phi_in))^(l+1),  Y = (1 + e_out cos(phi_out))^l
-    X_in  = (1 + e_in*np.cos(phi_in))**(l+1)   # shape (N,)
-    Y_out = (1 + e_out*np.cos(phi_out))**(l)   # shape (N,)
-
-    # 4) Broadcast to 2-D arrays
-    X2d = X_in.reshape(N,1)   # shape (N,1)
-    Y2d = Y_out.reshape(1,N)  # shape (1,N)
-
-    # 5) Weight matrix
-    W2d = w_in.reshape(N,1) * w_out.reshape(1,N)
-
-    # 6) Piecewise integrand
-    #    region1 where X2d < c * Y2d ⇒ integrand = X2d / Y2d
-    #    region2 otherwise             ⇒ integrand = (1/alpha^2) * (Y2d / X2d)
-    mask        = (X2d < c * Y2d)
-    region1_vals = X2d / Y2d
-    region2_vals = (1.0/alpha**2) * (Y2d / X2d)
-
-    integrand = np.where(mask, region1_vals, region2_vals)  # (N,N)
-    total     = np.sum(integrand * W2d)
-    return total / (np.pi**2)
+        orb = self.primary
+        return np.sqrt(self.G * self.M_central / (orb.a ** 3))
 
 
-def J_ijl(m_i, m_j, r_i, r_j, l, G=1.0, s_ijl=1.0):
-    """
-    Compute J_{ijl} = G m_i m_j s_{ij}^l [P_l(0)]^2 r_<^l / r_>^{l+1}.
-    Here l is the *actual* Legendre index (even).  
-    """
-    r_less    = np.minimum(r_i, r_j)
-    r_greater = np.maximum(r_i, r_j)
-    P_l0      = P_l_at_zero(l)  # = P_l(0)
-
-    return G * m_i * m_j * s_ijl * (P_l0**2) * (r_less**l) / (r_greater**(l+1))
+# ---------------------------------------------------------------------------
+# Legendre helpers
+# ---------------------------------------------------------------------------
 
 
-def X_func(x, z):
-    """
-    Compute X = sqrt(1 - 2 x z + z^2)
-    """
-    return np.sqrt(1 - 2*x*z + z**2)
+def even_ells(l_max: int, start: int = 2) -> np.ndarray:
+    """Return even Legendre indices from ``start`` up to ``l_max`` (inclusive)."""
 
-def Y_func(x, z):
-    """
-    Compute Y = sqrt(1 + 2 x z + z^2)
-    """
-    return np.sqrt(1 + 2*x*z + z**2)
-
-# def Omega(m_i, m_j, a_i, a_j, cos_theta, e_i=0, e_j=0,  G=1, Mbh=1, l_max = 2):
-
-#     L_i = m_i*np.sqrt(G*Mbh*a_i*(1-e_i**2))
-#     L_j = m_j*np.sqrt(G*Mbh*a_j*(1-e_j**2))
-
-#     l = 2
-#     Omega = 0
-#     while (l < l_max+1):
-
-#         s_ijl_ = s_ijl(a_i, a_j, e_i, e_j, l)
-#         Jijl_ = J_ijl(m_i, m_j, a_i, a_j, l,s_ijl = s_ijl_ )
-#         Omega += Jijl_/(L_i)*P_l_prime(l, cos_theta)
-        
-#         l += 2
-    
-#     return Omega
+    if l_max < start:
+        return np.array([], dtype=int)
+    first = start + (start % 2)
+    return np.arange(first, l_max + 1, 2, dtype=int)
 
 
-import concurrent.futures as _cf
+def legendre_P(l: int, x: float) -> float:
+    """Evaluate the Legendre polynomial ``P_l(x)``."""
 
-def Omega(m_i, m_j, a_i, a_j, cos_theta,
-          e_i=0, e_j=0, G=1, Mbh=1, l_max=2,
-          parallel=False, max_workers=None):
-    """
-    Compute Ω_ij up to multipole order l_max (even l ≥ 2).
-
-    Parameters
-    ----------
-    parallel : bool, default False
-        If True, each ℓ-term is evaluated concurrently with
-        `concurrent.futures.ProcessPoolExecutor`.
-    max_workers : int or None
-        Passed to the executor; None lets Python pick a sensible value.
-
-    All other parameters are identical to the original routine.
-    """
-    # pre-compute the two angular momenta
-    L_i = m_i * (G * Mbh * a_i * (1 - e_i**2))**0.5
-    L_j = m_j * (G * Mbh * a_j * (1 - e_j**2))**0.5
-
-    # -----------------------------------------------------------------
-    # helper that returns one term  J_ijl / L_i * P'_l(cos θ)
-    # -----------------------------------------------------------------
-    def _one_term(l):
-        s   = s_ijl(a_i, a_j, e_i, e_j, l)
-        Jij = J_ijl(m_i, m_j, a_i, a_j, l, s_ijl=s)
-        return Jij / L_i * P_l_prime(l, cos_theta)
-
-    # -----------------------------------------------------------------
-    # serial or parallel evaluation
-    # -----------------------------------------------------------------
-    l_vals = list(range(2, l_max + 1, 2))
-    if not parallel or len(l_vals) == 1:
-        # original behaviour (serial)
-        Omega_val = sum(_one_term(l) for l in l_vals)
-    else:
-        # parallel execution
-        #with _cf.ProcessPoolExecutor(max_workers=max_workers) as ex:
-        with _cf.ThreadPoolExecutor(max_workers=max_workers) as ex:    
-            Omega_val = sum(ex.map(_one_term, l_vals))
-
-    return Omega_val
+    return float(sp.lpmv(0, l, x))
 
 
-def omega_orb(a, G = 1, Mbh = 1):
-    '''Keplerian orbital frequency'''
-    t_orb = 2*np.pi*np.sqrt(a**3/(G*Mbh))
-    return 1.0/t_orb
+def legendre_P_derivative(l: int, x: float) -> float:
+    """Derivative of the Legendre polynomial ``d/dx P_l(x)``."""
 
-def Omega_c_asymp_z1(a_i, m_j, cos_theta, G=1, Mbh=1):
-    '''Small-angle (theta << 1) approximation for z = 1'''
-    theta = np.arccos(cos_theta)
-    return 2*omega_orb(a_i, G = 1, Mbh = 1)*m_j/Mbh *1/theta**2 
-
-def Omega_c_asymp(a_i, a_j, m_j, cos_theta, G=1, Mbh=1):
-    """
-    Asymptotic + correction approximation of Omega_{ij} for circular orbits.
-    Determines inner/outer orbit from a_i, a_j.
-    """
-    # Determine inner and outer semimajor axes
-    if a_i < a_j:
-        a_in, a_out = a_i, a_j
-    else:
-        a_in, a_out = a_j, a_i
-
-    x = cos_theta
-    z = a_in / a_out
-
-    X = X_func(x, z)
-    Y = Y_func(x, z)
-
-    # Precompute P'_2(x) and P'_4(x)
-    P2p = P_l_prime(2, x)
-    P4p = P_l_prime(4, x)
-
-    # Coefficients
-    c2 = (1.0/np.pi) - 0.25
-    c4 = (1.0/(2*np.pi)) - (9.0/64)
-
-    # Terms from S'_{ij}
-    term_quad  = c2 * P2p * z**2
-    term_oct   = -c4 * P4p * z**4
-    term_corr1 = z * (1 + X) / (np.pi * (1 - x*z + X) * X)
-    term_corr2 = z * (1 + Y) / (np.pi * (1 + x*z + Y) * Y)
-
-    S_prime = term_quad + term_oct + term_corr1 - term_corr2
-
-    # Omega_{ij} = 2π ω_i (m_j / Mbh) (a_in / a_out) S_prime
-    Omega = 2 * np.pi * omega_orb(a_in, G, Mbh) * (m_j / Mbh) * (a_in / a_out) * S_prime
-    return Omega
-
-def dOmega_c_dtheta(a_i, a_j, m_j, cos_theta, G=1, Mbh=1, h=1e-6):
-    theta = np.arccos(cos_theta)
-    return (Omega_c_asymp(a_i, a_j, m_j, np.cos(theta + h), G, Mbh)
-          - Omega_c_asymp(a_i, a_j, m_j, np.cos(theta - h), G, Mbh)) / (2*h)
+    if abs(x) == 1.0:
+        return 0.0
+    return float(-sp.lpmv(1, l, x) / np.sqrt(max(1.0 - x * x, 1.0e-300)))
 
 
-def dOmega_dtheta(m_i, m_j, a_i, a_j, cos_theta,
-                  e_i=0, e_j=0, G=1, Mbh=1, l_max=2, h=1e-6):
-    """
-    Numerical θ-derivative of the general Ω function.
-    
-    Uses central difference in θ:
-      θ = arccos(cos_theta)
-      dΩ/dθ ≈ [Ω(cos(θ+h)) – Ω(cos(θ–h))] / (2h)
-    
-    Parameters match those of Omega(...), plus:
-      h     : small step in radians for finite difference
-      l_max : maximum even harmonic (passed to Omega)
-    """
-    # Recover θ from cosθ
-    theta = np.arccos(cos_theta)
+def legendre_P_zero(l: int) -> float:
+    """Value of ``P_l(0)`` computed in log-space for numerical stability."""
 
-    # Evaluate Ω at θ + h and θ - h
-    cos_plus  = np.cos(theta + h)
-    cos_minus = np.cos(theta - h)
+    if l % 2 == 1:
+        return 0.0
+    k = l // 2
+    log_gamma_2k = sp.gammaln(2 * k + 1)
+    log_gamma_k = sp.gammaln(k + 1)
+    log_val = log_gamma_2k - 2 * k * np.log(2.0) - 2 * log_gamma_k
+    return ((-1) ** k) * np.exp(log_val)
 
-    Omega_plus  = Omega(m_i, m_j, a_i, a_j, cos_plus,
-                        e_i, e_j, G, Mbh, l_max)
-    Omega_minus = Omega(m_i, m_j, a_i, a_j, cos_minus,
-                        e_i, e_j, G, Mbh, l_max)
 
-    return (Omega_plus - Omega_minus) / (2 * h)
+# ---------------------------------------------------------------------------
+# Exact s_ijl and J_{ijl}
+# ---------------------------------------------------------------------------
+
+
+def _s_ijl_non_overlapping(pair: OrbitPair, ell: int) -> float:
+    """Return ``s_{ijℓ}`` for non-overlapping orbits using the closed form."""
+
+    inner, outer = pair.inner, pair.outer
+    chi_in = inner.chi
+    chi_out = outer.chi
+    prefactor = (chi_out ** ell) / (chi_in ** (ell + 1))
+    value = prefactor * legendre_P(ell + 1, chi_in) * legendre_P(ell - 1, chi_out)
+    return float(value)
+
+
+def _s_ijl_overlapping(pair: OrbitPair, ell: int, nodes: int = 80) -> float:
+    """Return ``s_{ijℓ}`` for overlapping orbits via Gauss-Legendre quadrature."""
+
+    inner, outer = pair.inner, pair.outer
+    alpha = inner.a / outer.a
+    c_val = 1.0 / max(alpha, 1.0e-300)
+
+    nodes_in, weights_in = np.polynomial.legendre.leggauss(nodes)
+    phi_in = 0.5 * (nodes_in + 1.0) * np.pi
+    w_in = 0.5 * np.pi * weights_in
+
+    nodes_out, weights_out = np.polynomial.legendre.leggauss(nodes)
+    phi_out = 0.5 * (nodes_out + 1.0) * np.pi
+    w_out = 0.5 * np.pi * weights_out
+
+    x_in = (1.0 + inner.e * np.cos(phi_in)) ** (ell + 1)
+    y_out = (1.0 + outer.e * np.cos(phi_out)) ** ell
+
+    x2d = x_in.reshape(nodes, 1)
+    y2d = y_out.reshape(1, nodes)
+    weights = w_in.reshape(nodes, 1) * w_out.reshape(1, nodes)
+
+    mask = x2d < c_val * y2d
+    region1 = x2d / np.maximum(y2d, 1.0e-300)
+    region2 = (1.0 / (alpha ** 2)) * (y2d / np.maximum(x2d, 1.0e-300))
+    integrand = np.where(mask, region1, region2)
+
+    total = np.sum(integrand * weights)
+    return float(total / (np.pi ** 2))
+
+
+def s_ijl(pair: OrbitPair, ell: int) -> float:
+    """Return the coefficient ``s_{ijℓ}`` for the supplied pair and index."""
+
+    if ell == 0:
+        return 1.0
+    if pair.inner.e == 0.0 and pair.outer.e == 0.0:
+        return 1.0
+    if pair.non_overlapping:
+        return _s_ijl_non_overlapping(pair, ell)
+    return _s_ijl_overlapping(pair, ell)
+
+
+def J_exact(pair: OrbitPair, ell: int) -> float:
+    """Return the exact coupling coefficient ``J_{ijℓ}``."""
+
+    alpha = pair.semi_major_ratio
+    s_val = s_ijl(pair, ell)
+    r_outer = pair.outer.a
+    prefactor = pair.G * pair.primary.m * pair.secondary.m / r_outer
+    return float(prefactor * (legendre_P_zero(ell) ** 2) * s_val * (alpha ** ell))
+
+
+# ---------------------------------------------------------------------------
+# Asymptotic kernels and auxiliary integrals
+# ---------------------------------------------------------------------------
+
+
+def Sprime_ecc_kernel(x: float, z: float) -> float:
+    """Return the eccentric--eccentric asymptotic kernel ``S'(x; z)``."""
+
+    X = np.sqrt(max(1.0 - 2.0 * x * z + z * z, 0.0))
+    Y = np.sqrt(1.0 + 2.0 * x * z + z * z)
+    log1 = np.log(((1.0 + X + z) * (1.0 + Y - z)) / 4.0)
+    log2 = np.log(((1.0 + X - z) * (1.0 + Y + z)) / 4.0)
+    return 0.5 * (log1 / (1.0 - x) - log2 / (1.0 + x))
+
+
+def Sprime_circ_log_kernel(x: float, alpha: float) -> float:
+    """Return the circular--circular logarithmic kernel."""
+
+    z = alpha
+    X = np.sqrt(max(1.0 - 2.0 * x * z + z * z, 0.0))
+    Y = np.sqrt(1.0 + 2.0 * x * z + z * z)
+    c2 = (1.0 / np.pi) - 0.25
+    c4 = (1.0 / (2.0 * np.pi)) - (9.0 / 64.0)
+    value = (
+        c2 * legendre_P_derivative(2, x) * z * z
+        - c4 * legendre_P_derivative(4, x) * (z ** 4)
+    )
+    term1 = z * (1.0 + X) / (np.pi * (1.0 - x * z + X) * max(X, 1.0e-15))
+    term2 = z * (1.0 + Y) / (np.pi * (1.0 + x * z + Y) * max(Y, 1.0e-15))
+    return value + term1 - term2
+
+
+def S2_even_integral_kernel(x: float, z: float) -> float:
+    """Return the ``S_2`` kernel for one-circular mixed configurations."""
+
+    def integrand(t: float) -> float:
+        """Integrand for the ``S_2`` kernel quadrature."""
+
+        q = z * t
+        A = (1.0 - 2.0 * x * q + q * q) ** (-1.5)
+        B = (1.0 + 2.0 * x * q + q * q) ** (-1.5)
+        return np.sqrt(-np.log(max(t, 1.0e-300))) * z * (A - B)
+
+    val, _ = quad(integrand, 0.0, 1.0, epsabs=1.0e-10, epsrel=1.0e-10, limit=200)
+    return float(val / np.sqrt(np.pi))
+
+
+def I2_numeric(a: float, b: float, c: float, d: float) -> float:
+    """Evaluate the integral ``I_2`` for overlapping eccentric annuli."""
+
+    if not (a < b <= c < d):
+        if abs(b - c) <= 1.0e-12 * max(d, 1.0):
+            denom = np.sqrt(max((b - a) * (d - b), 1.0e-300))
+            return float(np.pi * (b * b) / denom)
+        raise ValueError(f"Bad ordering in I2 integral: {a}, {b}, {c}, {d}")
+
+    midpoint = 0.5 * (b + c)
+    half_range = 0.5 * (c - b)
+
+    def integrand(t: float) -> float:
+        """Integrand for the ``I_2`` overlap quadrature."""
+
+        r = midpoint + half_range * np.sin(t)
+        dr = half_range * np.cos(t)
+        denominator = np.sqrt(
+            max(r - a, 1.0e-300)
+            * max(r - b, 1.0e-300)
+            * max(c - r, 1.0e-300)
+            * max(d - r, 1.0e-300)
+        )
+        return (r * r) * dr / denominator
+
+    val, _ = quad(integrand, -np.pi / 2.0, np.pi / 2.0, epsabs=1.0e-9, epsrel=1.0e-9, limit=200)
+    return float(val)
+
+
+def Jbar_ecc_nonoverlap(pair: OrbitPair) -> float:
+    """Return the non-overlapping eccentric asymptotic coupling ``\bar{J}``."""
+
+    inner, outer = pair.inner, pair.outer
+    prefactor = pair.G * pair.primary.m * pair.secondary.m / (np.pi * np.pi)
+    ratio = ((1.0 + inner.e) * (1.0 - outer.e)) ** 1.5
+    denom = np.sqrt(max(inner.e * outer.e, 1.0e-300))
+    return float(prefactor * ratio / denom / outer.periapsis)
+
+
+def Jbar_ecc_overlap(pair: OrbitPair) -> float:
+    """Return the overlapping eccentric asymptotic coupling ``\bar{J}``."""
+
+    inner, outer = pair.inner, pair.outer
+    a = min(inner.periapsis, outer.periapsis)
+    b = max(inner.periapsis, outer.periapsis)
+    c = min(inner.apoapsis, outer.apoapsis)
+    d = max(inner.apoapsis, outer.apoapsis)
+    integral = I2_numeric(a, b, c, d)
+    prefactor = 4.0 * pair.G * pair.primary.m * pair.secondary.m
+    return float(prefactor * integral / (np.pi ** 3 * inner.a * outer.a))
+
+
+# ---------------------------------------------------------------------------
+# Result containers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InteractionResult:
+    """Container bundling the interaction Hamiltonian, frequency and torque."""
+
+    hamiltonian: float
+    omega: float
+    torque: float
+    series_ell: Optional[np.ndarray] = None
+    series_coefficients: Optional[np.ndarray] = None
+    method: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Base evaluator
+# ---------------------------------------------------------------------------
+
+
+class BaseEvaluator:
+    """Abstract base class shared by the interaction evaluators."""
+
+    method_name: str = "base"
+
+    def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
+        """Return the interaction result for a single orbit pair."""
+
+        raise NotImplementedError
+
+    def evaluate_many(self, pairs: Sequence[OrbitPair]) -> List[InteractionResult]:
+        """Evaluate a sequence of orbit pairs."""
+
+        return [self.evaluate_pair(pair) for pair in pairs]
+
+    def evaluate_from_arrays(
+        self,
+        a_primary: Sequence[float],
+        e_primary: Sequence[float],
+        m_primary: Sequence[float],
+        a_secondary: Sequence[float],
+        e_secondary: Sequence[float],
+        m_secondary: Sequence[float],
+        cos_inclinations: Sequence[float],
+        G: float = 1.0,
+        M_central: float = 1.0,
+    ) -> List[InteractionResult]:
+        """Instantiate pairs from arrays and evaluate them sequentially."""
+
+        pairs = [
+            OrbitPair(
+                Orbit(a_p, e_p, m_p),
+                Orbit(a_s, e_s, m_s),
+                cos_inc,
+                G=G,
+                M_central=M_central,
+            )
+            for a_p, e_p, m_p, a_s, e_s, m_s, cos_inc in zip(
+                a_primary,
+                e_primary,
+                m_primary,
+                a_secondary,
+                e_secondary,
+                m_secondary,
+                cos_inclinations,
+            )
+        ]
+        return self.evaluate_many(pairs)
+
+
+# ---------------------------------------------------------------------------
+# Exact evaluator
+# ---------------------------------------------------------------------------
+
+
+class ExactSeriesEvaluator(BaseEvaluator):
+    """Compute the interaction via a truncated exact Legendre series."""
+
+    method_name = "exact"
+
+    def __init__(self, ell_max: int = 20) -> None:
+        """Initialise the evaluator with the maximum multipole order."""
+
+        if ell_max < 2:
+            raise ValueError("ell_max must be at least 2 for the quadrupole term.")
+        self.ell_max = ell_max
+
+    def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
+        """Evaluate the Hamiltonian, frequency and torque for ``pair``."""
+
+        ells_h = even_ells(self.ell_max, start=0)
+        if ells_h.size == 0:
+            return InteractionResult(0.0, 0.0, 0.0, method=self.method_name)
+
+        J_vals = np.array([J_exact(pair, int(ell)) for ell in ells_h], dtype=float)
+        P_vals = sp.lpmv(0, ells_h, pair.cos_inclination)
+        hamiltonian = float(np.dot(J_vals, P_vals))
+
+        mask = ells_h >= 2
+        if np.any(mask):
+            ells_omega = ells_h[mask]
+            J_omega = J_vals[mask]
+            P_prime_vals = np.array(
+                [
+                    legendre_P_derivative(int(ell), pair.cos_inclination)
+                    for ell in ells_omega
+                ],
+                dtype=float,
+            )
+            dH_dx = float(np.dot(J_omega, P_prime_vals))
+        else:
+            dH_dx = 0.0
+
+        L_i = max(pair.angular_momentum_primary, 1.0e-300)
+        omega = -dH_dx / L_i
+        torque = dH_dx * pair.sin_inclination
+
+        return InteractionResult(
+            hamiltonian=hamiltonian,
+            omega=omega,
+            torque=torque,
+            series_ell=ells_h,
+            series_coefficients=J_vals,
+            method=self.method_name,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Asymptotic evaluator
+# ---------------------------------------------------------------------------
+
+
+class AsymptoticEvaluator(BaseEvaluator):
+    """Evaluate interactions using asymptotic kernels for large ``ℓ``."""
+
+    method_name = "asymptotic"
+
+    def __init__(self, quad_epsabs: float = 1.0e-9, quad_epsrel: float = 1.0e-9) -> None:
+        """Initialise the evaluator with quadrature tolerances."""
+
+        self.quad_epsabs = quad_epsabs
+        self.quad_epsrel = quad_epsrel
+
+    def _omega_scalar(self, pair: OrbitPair, x: float) -> float:
+        """Return the asymptotic precession frequency for cosine ``x``."""
+
+        z = pair.z_parameter
+        omega_orb = pair.orbital_frequency_primary
+        L_i = max(pair.angular_momentum_primary, 1.0e-300)
+        tag = pair.circular_configuration
+
+        if tag == "both":
+            kernel = Sprime_circ_log_kernel(x, pair.inner.a / pair.outer.a)
+            return -2.0 * np.pi * omega_orb * (pair.secondary.m / pair.M_central) * (
+                pair.inner.a / pair.outer.a
+            ) * kernel
+
+        if tag in {"inner", "outer"}:
+            if pair.non_overlapping:
+                ecc_orbit = pair.outer if tag == "inner" else pair.inner
+                a_out = pair.outer.a
+                prefactor = (
+                    pair.G
+                    * pair.primary.m
+                    * pair.secondary.m
+                    / a_out
+                    * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
+                    * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
+                )
+                dH_dx = prefactor * S2_even_integral_kernel(x, z)
+                return -dH_dx / L_i
+
+            J_bar = Jbar_ecc_overlap(pair)
+            kappa = J_bar / max(L_i * omega_orb, 1.0e-300)
+            theta = np.arccos(np.clip(x, -1.0, 1.0))
+            sin_theta = max(np.sin(theta), 1.0e-15)
+            return -0.5 * kappa * omega_orb * (np.cos(theta) / sin_theta)
+
+        if pair.non_overlapping:
+            J_bar = Jbar_ecc_nonoverlap(pair)
+            kappa = J_bar / max(L_i * omega_orb, 1.0e-300)
+            return -kappa * omega_orb * Sprime_ecc_kernel(x, z)
+
+        J_bar = Jbar_ecc_overlap(pair)
+        kappa = J_bar / max(L_i * omega_orb, 1.0e-300)
+        theta = np.arccos(np.clip(x, -1.0, 1.0))
+        sin_theta = max(np.sin(theta), 1.0e-15)
+        return -0.5 * kappa * omega_orb * (np.cos(theta) / sin_theta)
+
+    def _hamiltonian_from_omega(self, pair: OrbitPair) -> float:
+        """Recover the Hamiltonian by integrating the asymptotic frequency."""
+
+        x = pair.cos_inclination
+        if abs(x - 1.0) < 1.0e-12:
+            return 0.0
+
+        def integrand(u: float) -> float:
+            """Integrand for reconstructing the Hamiltonian from ``Omega``."""
+
+            return -pair.angular_momentum_primary * self._omega_scalar(pair, u)
+
+        val, _ = quad(
+            integrand,
+            1.0,
+            x,
+            epsabs=self.quad_epsabs,
+            epsrel=self.quad_epsrel,
+            limit=200,
+        )
+        return float(val)
+
+    def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
+        """Return the asymptotic interaction result for ``pair``."""
+
+        omega = self._omega_scalar(pair, pair.cos_inclination)
+        hamiltonian = self._hamiltonian_from_omega(pair)
+        torque = -pair.angular_momentum_primary * omega * pair.sin_inclination
+        return InteractionResult(
+            hamiltonian=hamiltonian,
+            omega=omega,
+            torque=torque,
+            method=self.method_name,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Hybrid evaluator (asymptotic with low-order corrections)
+# ---------------------------------------------------------------------------
+
+
+class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
+    """Augment the asymptotic result with low-order exact corrections."""
+
+    method_name = "asymptotic_with_corrections"
+
+    def __init__(self, lmax_correction: int = 4, **kwargs) -> None:
+        """Initialise the hybrid evaluator and select correction order."""
+
+        super().__init__(**kwargs)
+        if lmax_correction < 2:
+            raise ValueError("The correction order must be at least 2.")
+        self.lmax_correction = lmax_correction
+
+    def _asymptotic_J(self, pair: OrbitPair, ell: int) -> float:
+        """Return the asymptotic approximation of ``J_{ijℓ}``."""
+
+        tag = pair.circular_configuration
+        if tag == "both":
+            return 0.0
+
+        if tag in {"inner", "outer"} and pair.non_overlapping:
+            z = pair.z_parameter
+            ecc_orbit = pair.outer if tag == "inner" else pair.inner
+            a_out = pair.outer.a
+            prefactor = (
+                pair.G
+                * pair.primary.m
+                * pair.secondary.m
+                / a_out
+                * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
+                * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
+            )
+            return float(prefactor * (z ** ell) / (ell ** 1.5))
+
+        if pair.non_overlapping:
+            J_bar = Jbar_ecc_nonoverlap(pair)
+            return float(J_bar / (ell * ell))
+
+        J_bar = Jbar_ecc_overlap(pair)
+        return float(J_bar / (ell * ell))
+
+    def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
+        """Return the hybrid interaction result for ``pair``."""
+
+        base_result = super().evaluate_pair(pair)
+        ells = even_ells(self.lmax_correction)
+        if ells.size == 0:
+            return base_result
+
+        delta_J = []
+        for ell in ells:
+            exact_val = J_exact(pair, int(ell))
+            asym_val = self._asymptotic_J(pair, int(ell))
+            delta_J.append(exact_val - asym_val)
+
+        delta_J = np.array(delta_J, dtype=float)
+        P_vals = sp.lpmv(0, ells, pair.cos_inclination)
+        P_prime_vals = np.array(
+            [legendre_P_derivative(int(ell), pair.cos_inclination) for ell in ells],
+            dtype=float,
+        )
+
+        delta_H = float(np.dot(delta_J, P_vals))
+        delta_dH_dx = float(np.dot(delta_J, P_prime_vals))
+
+        L_i = max(pair.angular_momentum_primary, 1.0e-300)
+        omega = base_result.omega - delta_dH_dx / L_i
+        torque = base_result.torque + delta_dH_dx * pair.sin_inclination
+        hamiltonian = base_result.hamiltonian + delta_H
+
+        return InteractionResult(
+            hamiltonian=hamiltonian,
+            omega=omega,
+            torque=torque,
+            series_ell=ells,
+            series_coefficients=delta_J,
+            method=self.method_name,
+        )
+
+
+__all__ = [
+    "Orbit",
+    "OrbitPair",
+    "InteractionResult",
+    "ExactSeriesEvaluator",
+    "AsymptoticEvaluator",
+    "AsymptoticWithCorrectionsEvaluator",
+]
