@@ -243,8 +243,7 @@ def _s_ijl_overlapping(pair: OrbitPair, ell: int, nodes: int = 80) -> float:
     """Return ``s_{ijℓ}`` for overlapping orbits via Gauss-Legendre quadrature."""
 
     inner, outer = pair.inner, pair.outer
-    alpha = inner.a / outer.a
-    c_val = 1.0 / max(alpha, 1.0e-300)
+    alpha = max(inner.a / outer.a, 1.0e-300)
 
     nodes_in, weights_in = np.polynomial.legendre.leggauss(nodes)
     phi_in = 0.5 * (nodes_in + 1.0) * np.pi
@@ -254,17 +253,16 @@ def _s_ijl_overlapping(pair: OrbitPair, ell: int, nodes: int = 80) -> float:
     phi_out = 0.5 * (nodes_out + 1.0) * np.pi
     w_out = 0.5 * np.pi * weights_out
 
-    x_in = (1.0 + inner.e * np.cos(phi_in)) ** (ell + 1)
-    y_out = (1.0 + outer.e * np.cos(phi_out)) ** ell
+    A = 1.0 + inner.e * np.cos(phi_in)
+    B = 1.0 + outer.e * np.cos(phi_out)
 
-    x2d = x_in.reshape(nodes, 1)
-    y2d = y_out.reshape(1, nodes)
+    A2d = A.reshape(nodes, 1)
+    B2d = B.reshape(1, nodes)
     weights = w_in.reshape(nodes, 1) * w_out.reshape(1, nodes)
 
-    mask = x2d < c_val * y2d
-    region1 = x2d / np.maximum(y2d, 1.0e-300)
-    region2 = (1.0 / (alpha ** 2)) * (y2d / np.maximum(x2d, 1.0e-300))
-    integrand = np.where(mask, region1, region2)
+    numerator = np.minimum(A2d, B2d / alpha) ** (ell + 1)
+    denominator = np.maximum(alpha * A2d, B2d) ** ell
+    integrand = numerator / np.maximum(denominator, 1.0e-300)
 
     total = np.sum(integrand * weights)
     return float(total / (np.pi ** 2))
@@ -546,8 +544,9 @@ class AsymptoticEvaluator(BaseEvaluator):
 
         if tag == "both":
             kernel = Sprime_circ_log_kernel(x, pair.inner.a / pair.outer.a)
-            return -2.0 * np.pi * omega_orb * (pair.secondary.m / pair.M_central) * (
-                pair.inner.a / pair.outer.a
+            radius_ratio = pair.primary.a / pair.outer.a
+            return 2.0 * np.pi * omega_orb * (pair.secondary.m / pair.M_central) * (
+                radius_ratio
             ) * kernel
 
         if tag in {"inner", "outer"}:
