@@ -13,7 +13,7 @@ efficiently.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import scipy.special as sp
@@ -758,6 +758,87 @@ def Omega_partial_sums(
     return np.cumsum(Omega_terms(ells, J_ell, cos_theta, L_i))
 
 
+@dataclass
+class LegendreSeriesData:
+    """Container holding the results of a Legendre-series evaluation."""
+
+    ells: np.ndarray
+    geometry_coefficients: np.ndarray
+    physical_coefficients: np.ndarray
+    hamiltonian: float
+    omega: float
+    torque: float
+    hamiltonian_terms: Optional[np.ndarray] = None
+    hamiltonian_partial_sums: Optional[np.ndarray] = None
+    omega_terms: Optional[np.ndarray] = None
+    omega_partial_sums: Optional[np.ndarray] = None
+
+
+def _evaluate_legendre_series(
+    pair: OrbitPair,
+    ells: Sequence[int],
+    geometry_coefficients: np.ndarray,
+    *,
+    include_terms: bool = False,
+    include_partials: bool = False,
+) -> LegendreSeriesData:
+    """Return Hamiltonian, frequency and torque from geometry-only series."""
+
+    ell_arr = np.asarray(ells, dtype=int)
+    geom_arr = np.asarray(geometry_coefficients, dtype=float).reshape(ell_arr.shape)
+    mass = pair.mass_prefactor()
+    physical = mass * geom_arr
+
+    if ell_arr.size == 0:
+        torque = pair.torque_from_omega(0.0)
+        return LegendreSeriesData(
+            ell_arr,
+            geom_arr,
+            physical,
+            0.0,
+            0.0,
+            torque,
+            np.zeros(0, dtype=float) if include_terms else None,
+            np.zeros(0, dtype=float) if include_partials else None,
+            np.zeros(0, dtype=float) if include_terms else None,
+            np.zeros(0, dtype=float) if include_partials else None,
+        )
+
+    cos_inc = float(pair.cos_inclination)
+    P_vals = np.asarray(legendre_P(ell_arr, cos_inc), dtype=float)
+    h_terms_geom = geom_arr * P_vals
+    hamiltonian_geom = float(np.sum(h_terms_geom))
+
+    P_prime_vals = np.asarray(legendre_P_derivative(ell_arr, cos_inc), dtype=float)
+    gradient_geom = geom_arr * P_prime_vals
+    L_i = max(pair.angular_momentum_primary, 1.0e-300)
+    omega_terms_geom = -gradient_geom / L_i
+    omega_geom = float(np.sum(omega_terms_geom))
+
+    hamiltonian = mass * hamiltonian_geom
+    omega = mass * omega_geom
+    torque = pair.torque_from_omega(omega)
+
+    h_terms = mass * h_terms_geom if include_terms else None
+    omega_terms = mass * omega_terms_geom if include_terms else None
+
+    h_partial = mass * np.cumsum(h_terms_geom) if include_partials else None
+    omega_partial = mass * np.cumsum(omega_terms_geom) if include_partials else None
+
+    return LegendreSeriesData(
+        ell_arr,
+        geom_arr,
+        physical,
+        hamiltonian,
+        omega,
+        torque,
+        h_terms,
+        h_partial,
+        omega_terms,
+        omega_partial,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Asymptotic kernels and auxiliary integrals
 # ---------------------------------------------------------------------------
@@ -914,6 +995,291 @@ def Jbar_ecc_overlap(pair: OrbitPair) -> float:
     d = max(inner.apoapsis, outer.apoapsis)
     integral = I2_numeric(a, b, c, d)
     return float(4.0 * integral / (np.pi ** 3 * inner.a * outer.a))
+
+
+def _asymptotic_ell_grid_default(ell_max: int) -> np.ndarray:
+    """Return the default ℓ-grid used by the asymptotic evaluators."""
+
+    return even_ells(ell_max, start=2)
+
+
+def _J_asymptotic_both_circular(
+    pair: OrbitPair, ells: Sequence[int], tag: Optional[str] = None
+) -> np.ndarray:
+    """Return asymptotic ``J_{ijℓ}`` values for two circular orbits."""
+
+    ell_arr = np.asarray(ells, dtype=int)
+    return np.zeros_like(ell_arr, dtype=float)
+
+
+def _J_asymptotic_one_circular_non_overlap(
+    pair: OrbitPair, ells: Sequence[int], tag: Optional[str]
+) -> np.ndarray:
+    """Return asymptotic ``J_{ijℓ}`` for mixed (one circular) non-overlap pairs."""
+
+    if tag not in {"inner", "outer"}:
+        raise ValueError("Circular configuration tag required for mixed regime.")
+
+    ell_arr = np.asarray(ells, dtype=int)
+    if ell_arr.size == 0:
+        return np.zeros_like(ell_arr, dtype=float)
+
+    safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
+    z = float(pair.z_parameter)
+    ecc_orbit = pair.outer if tag == "inner" else pair.inner
+    a_out = max(pair.outer.a, 1.0e-300)
+    prefactor = (
+        (1.0 / a_out)
+        * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
+        * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
+    )
+    powers = np.asarray(z ** ell_arr, dtype=float)
+    result = prefactor * powers / (safe_ell ** 1.5)
+    return result.astype(float, copy=False)
+
+
+def _J_asymptotic_non_overlap(
+    pair: OrbitPair, ells: Sequence[int], tag: Optional[str] = None
+) -> np.ndarray:
+    """Return asymptotic ``J_{ijℓ}`` for eccentric non-overlapping orbits."""
+
+    ell_arr = np.asarray(ells, dtype=int)
+    if ell_arr.size == 0:
+        return np.zeros_like(ell_arr, dtype=float)
+
+    safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
+    J_bar = Jbar_ecc_nonoverlap(pair)
+    result = J_bar / (safe_ell ** 2)
+    return np.asarray(result, dtype=float)
+
+
+def _J_asymptotic_overlap(
+    pair: OrbitPair, ells: Sequence[int], tag: Optional[str] = None
+) -> np.ndarray:
+    """Return asymptotic ``J_{ijℓ}`` for overlapping or embedded orbits."""
+
+    ell_arr = np.asarray(ells, dtype=int)
+    if ell_arr.size == 0:
+        return np.zeros_like(ell_arr, dtype=float)
+
+    safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
+    J_bar = Jbar_ecc_overlap(pair)
+    result = J_bar / (safe_ell ** 2)
+    return np.asarray(result, dtype=float)
+
+
+def _omega_kernel_both_circular(
+    pair: OrbitPair, x: float, tag: Optional[str] = None
+) -> float:
+    """Return the analytic ``Ω`` kernel for two circular orbits."""
+
+    alpha = max(pair.inner.a / max(pair.outer.a, 1.0e-300), 0.0)
+    kernel = Sprime_circ_log_kernel(float(x), alpha)
+    radius_ratio = pair.primary.a / max(pair.outer.a, 1.0e-300)
+    omega_orb = pair.orbital_frequency_primary
+    return (
+        2.0
+        * np.pi
+        * omega_orb
+        * (pair.secondary.m / pair.M_central)
+        * radius_ratio
+        * kernel
+    )
+
+
+def _omega_kernel_one_circular_non_overlap(
+    pair: OrbitPair, x: float, tag: Optional[str]
+) -> float:
+    """Return the analytic ``Ω`` kernel for mixed non-overlap configurations."""
+
+    if tag not in {"inner", "outer"}:
+        raise ValueError("Circular configuration tag required for mixed regime.")
+
+    z = float(pair.z_parameter)
+    ecc_orbit = pair.outer if tag == "inner" else pair.inner
+    a_out = max(pair.outer.a, 1.0e-300)
+    prefactor = (
+        (1.0 / a_out)
+        * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
+        * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
+    )
+    dH_dx_geom = prefactor * S2_even_integral_kernel(float(x), z)
+    L_i = max(pair.angular_momentum_primary, 1.0e-300)
+    return -(pair.mass_prefactor() * dH_dx_geom) / L_i
+
+
+def _omega_kernel_non_overlap(
+    pair: OrbitPair, x: float, tag: Optional[str] = None
+) -> float:
+    """Return the analytic ``Ω`` kernel for eccentric non-overlapping orbits."""
+
+    z = float(pair.z_parameter)
+    J_bar_geom = Jbar_ecc_nonoverlap(pair)
+    omega_orb = pair.orbital_frequency_primary
+    L_i = max(pair.angular_momentum_primary, 1.0e-300)
+    denom = max(L_i * omega_orb, 1.0e-300)
+    kappa_geom = J_bar_geom / denom
+    return -pair.mass_prefactor() * kappa_geom * omega_orb * Sprime_ecc_kernel(float(x), z)
+
+
+def _omega_kernel_overlap(
+    pair: OrbitPair, x: float, tag: Optional[str] = None
+) -> float:
+    """Return the analytic ``Ω`` kernel for overlapping or embedded orbits."""
+
+    J_bar_geom = Jbar_ecc_overlap(pair)
+    omega_orb = pair.orbital_frequency_primary
+    L_i = max(pair.angular_momentum_primary, 1.0e-300)
+    denom = max(L_i * omega_orb, 1.0e-300)
+    kappa_geom = J_bar_geom / denom
+    theta = np.arccos(np.clip(float(x), -1.0, 1.0))
+    sin_theta = max(np.sin(theta), 1.0e-15)
+    factor = -0.5 * pair.mass_prefactor() * kappa_geom * omega_orb
+    return factor * (np.cos(theta) / sin_theta)
+
+
+def _integrate_kernel(
+    pair: OrbitPair,
+    omega_kernel: Callable[[OrbitPair, float, Optional[str]], float],
+    tag: Optional[str],
+    quad_epsabs: float,
+    quad_epsrel: float,
+) -> float:
+    """Integrate the analytic ``Ω`` kernel to recover the Hamiltonian."""
+
+    x = float(pair.cos_inclination)
+    if abs(x - 1.0) < 1.0e-12:
+        return 0.0
+
+    def integrand(u: float) -> float:
+        return -pair.angular_momentum_primary * omega_kernel(pair, float(u), tag)
+
+    val, _ = quad(
+        integrand,
+        1.0,
+        x,
+        epsabs=quad_epsabs,
+        epsrel=quad_epsrel,
+        limit=200,
+    )
+    return float(val)
+
+
+@dataclass(frozen=True)
+class AsymptoticRegimeEntry:
+    """Describe the ℓ-grid, couplings and kernels for an orbital regime."""
+
+    ell_factory: Callable[[int], np.ndarray]
+    j_function: Callable[[OrbitPair, Sequence[int], Optional[str]], np.ndarray]
+    omega_kernel: Callable[[OrbitPair, float, Optional[str]], float]
+
+    def ell_grid(self, ell_max: int) -> np.ndarray:
+        return np.asarray(self.ell_factory(ell_max), dtype=int)
+
+    def couplings(
+        self, pair: OrbitPair, ells: Sequence[int], tag: Optional[str]
+    ) -> np.ndarray:
+        return np.asarray(self.j_function(pair, ells, tag), dtype=float)
+
+    def kernel_values(
+        self,
+        pair: OrbitPair,
+        quad_epsabs: float,
+        quad_epsrel: float,
+        tag: Optional[str],
+    ) -> tuple[float, float]:
+        omega_val = float(self.omega_kernel(pair, pair.cos_inclination, tag))
+        h_val = _integrate_kernel(pair, self.omega_kernel, tag, quad_epsabs, quad_epsrel)
+        return h_val, omega_val
+
+
+ASYMPTOTIC_REGISTRY: Dict[str, AsymptoticRegimeEntry] = {
+    "both_circular": AsymptoticRegimeEntry(
+        _asymptotic_ell_grid_default,
+        _J_asymptotic_both_circular,
+        _omega_kernel_both_circular,
+    ),
+    "one_circular_non_overlap": AsymptoticRegimeEntry(
+        _asymptotic_ell_grid_default,
+        _J_asymptotic_one_circular_non_overlap,
+        _omega_kernel_one_circular_non_overlap,
+    ),
+    "eccentric_non_overlap": AsymptoticRegimeEntry(
+        _asymptotic_ell_grid_default,
+        _J_asymptotic_non_overlap,
+        _omega_kernel_non_overlap,
+    ),
+    "overlap": AsymptoticRegimeEntry(
+        _asymptotic_ell_grid_default,
+        _J_asymptotic_overlap,
+        _omega_kernel_overlap,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class AsymptoticComponents:
+    """Bundle asymptotic series data with its analytic kernel values."""
+
+    regime: str
+    tag: Optional[str]
+    ells: np.ndarray
+    geometry: np.ndarray
+    h_kernel: float
+    omega_kernel: float
+
+
+def _classify_asymptotic_regime(pair: OrbitPair) -> tuple[str, Optional[str]]:
+    """Return the registry key and circular tag for ``pair``."""
+
+    tag = pair.circular_configuration
+    if tag == "both":
+        return "both_circular", tag
+    if tag in {"inner", "outer"}:
+        if pair.non_overlapping:
+            return "one_circular_non_overlap", tag
+        return "overlap", tag
+    if pair.non_overlapping:
+        return "eccentric_non_overlap", None
+    return "overlap", None
+
+
+def _compute_asymptotic_couplings(
+    pair: OrbitPair, ell_arr: np.ndarray, *, regime: str, tag: Optional[str]
+) -> np.ndarray:
+    """Helper passed to :meth:`OrbitPair.get_couplings` for asymptotics."""
+
+    entry = ASYMPTOTIC_REGISTRY[regime]
+    return entry.couplings(pair, ell_arr, tag)
+
+
+def asymptotic_components(
+    pair: OrbitPair,
+    ell_max: int,
+    quad_epsabs: float,
+    quad_epsrel: float,
+) -> AsymptoticComponents:
+    """Return ℓ-grid, couplings and kernels for the asymptotic regime."""
+
+    regime, tag = _classify_asymptotic_regime(pair)
+    entry = ASYMPTOTIC_REGISTRY[regime]
+    ells = entry.ell_grid(ell_max)
+    geometry = pair.get_couplings(
+        f"asymptotic:{regime}",
+        ells,
+        _compute_asymptotic_couplings,
+        regime=regime,
+        tag=tag,
+    )
+    h_kernel, omega_kernel = entry.kernel_values(pair, quad_epsabs, quad_epsrel, tag)
+    return AsymptoticComponents(
+        regime=regime,
+        tag=tag,
+        ells=ells,
+        geometry=np.asarray(geometry, dtype=float),
+        h_kernel=h_kernel,
+        omega_kernel=omega_kernel,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1358,55 +1724,38 @@ class ExactSeriesEvaluator(BaseEvaluator):
             ecc_tol=self.eccentricity_tol,
         )
 
-        mass = pair.mass_prefactor()
-
-        cos_inc = pair.cos_inclination
-        P_vals = np.asarray(legendre_P(series_ell, cos_inc), dtype=float)
-        h_terms_geom = geom_vals * P_vals
-        h_partial_geom = np.cumsum(h_terms_geom)
-        hamiltonian = float(mass * h_partial_geom[-1])
-
-        P_prime_vals = np.asarray(legendre_P_derivative(series_ell, cos_inc), dtype=float)
-        gradient_geom = geom_vals * P_prime_vals
-        dH_dx_geom = float(np.sum(gradient_geom))
-        dH_dx = mass * dH_dx_geom
-
-        L_i = max(pair.angular_momentum_primary, 1.0e-300)
-        omega_terms_geom = -gradient_geom / L_i
-        omega_partial_geom = np.cumsum(omega_terms_geom)
-        omega = float(mass * omega_partial_geom[-1])
-        torque = pair.torque_from_omega(omega)
-
-        J_vals = mass * geom_vals
-        h_terms = mass * h_terms_geom
-        h_partial = mass * h_partial_geom
-        omega_terms = mass * omega_terms_geom
-        omega_partial = mass * omega_partial_geom
+        series_data = _evaluate_legendre_series(
+            pair,
+            series_ell,
+            geom_vals,
+            include_terms=True,
+            include_partials=True,
+        )
 
         result = InteractionResult(
-            hamiltonian=hamiltonian,
-            omega=omega,
-            torque=torque,
-            series_ell=series_ell,
-            series_coefficients=J_vals,
-            hamiltonian_terms=h_terms,
-            hamiltonian_partial_sums=h_partial,
-            omega_terms=omega_terms,
-            omega_partial_sums=omega_partial,
+            hamiltonian=series_data.hamiltonian,
+            omega=series_data.omega,
+            torque=series_data.torque,
+            series_ell=series_data.ells,
+            series_coefficients=series_data.physical_coefficients,
+            hamiltonian_terms=series_data.hamiltonian_terms,
+            hamiltonian_partial_sums=series_data.hamiltonian_partial_sums,
+            omega_terms=series_data.omega_terms,
+            omega_partial_sums=series_data.omega_partial_sums,
             method=self.method_name,
         )
 
         pair.cache_dynamics(
             self.method_name,
-            hamiltonian=hamiltonian,
-            omega=omega,
-            torque=torque,
-            series_ell=series_ell,
-            series_coefficients=J_vals,
-            hamiltonian_terms=h_terms,
-            hamiltonian_partial_sums=h_partial,
-            omega_terms=omega_terms,
-            omega_partial_sums=omega_partial,
+            hamiltonian=series_data.hamiltonian,
+            omega=series_data.omega,
+            torque=series_data.torque,
+            series_ell=series_data.ells,
+            series_coefficients=series_data.physical_coefficients,
+            hamiltonian_terms=series_data.hamiltonian_terms,
+            hamiltonian_partial_sums=series_data.hamiltonian_partial_sums,
+            omega_terms=series_data.omega_terms,
+            omega_partial_sums=series_data.omega_partial_sums,
         )
 
         return result
@@ -1422,94 +1771,20 @@ class AsymptoticEvaluator(BaseEvaluator):
 
     method_name = "asymptotic"
 
-    def __init__(self, quad_epsabs: float = 1.0e-9, quad_epsrel: float = 1.0e-9) -> None:
-        """Initialise the evaluator with quadrature tolerances."""
+    def __init__(
+        self,
+        ell_max: int = 40,
+        *,
+        quad_epsabs: float = 1.0e-9,
+        quad_epsrel: float = 1.0e-9,
+    ) -> None:
+        """Initialise the evaluator with its ℓ-grid and quadrature tolerances."""
 
+        if ell_max < 2:
+            raise ValueError("ell_max must be at least 2 for the quadrupole term.")
+        self.ell_max = int(ell_max)
         self.quad_epsabs = quad_epsabs
         self.quad_epsrel = quad_epsrel
-
-    def _omega_scalar(self, pair: OrbitPair, x: float) -> float:
-        """Return the asymptotic precession frequency for cosine ``x``."""
-
-        z = pair.z_parameter
-        omega_orb = pair.orbital_frequency_primary
-        L_i = max(pair.angular_momentum_primary, 1.0e-300)
-        tag = pair.circular_configuration
-
-        if tag == "both":
-            kernel = Sprime_circ_log_kernel(x, pair.inner.a / pair.outer.a)
-            radius_ratio = pair.primary.a / pair.outer.a
-            return 2.0 * np.pi * omega_orb * (pair.secondary.m / pair.M_central) * (
-                radius_ratio
-            ) * kernel
-
-        if tag in {"inner", "outer"}:
-            if pair.non_overlapping:
-                ecc_orbit = pair.outer if tag == "inner" else pair.inner
-                a_out = pair.outer.a
-                geom_prefactor = (
-                    (1.0 / a_out)
-                    * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
-                    * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
-                )
-                dH_dx_geom = geom_prefactor * S2_even_integral_kernel(x, z)
-                return -(pair.mass_prefactor() * dH_dx_geom) / L_i
-
-            J_bar_geom = Jbar_ecc_overlap(pair)
-            kappa_geom = J_bar_geom / max(L_i * omega_orb, 1.0e-300)
-            theta = np.arccos(np.clip(x, -1.0, 1.0))
-            sin_theta = max(np.sin(theta), 1.0e-15)
-            return (
-                -0.5
-                * pair.mass_prefactor()
-                * kappa_geom
-                * omega_orb
-                * (np.cos(theta) / sin_theta)
-            )
-
-        if pair.non_overlapping:
-            J_bar_geom = Jbar_ecc_nonoverlap(pair)
-            kappa_geom = J_bar_geom / max(L_i * omega_orb, 1.0e-300)
-            return (
-                -pair.mass_prefactor()
-                * kappa_geom
-                * omega_orb
-                * Sprime_ecc_kernel(x, z)
-            )
-
-        J_bar_geom = Jbar_ecc_overlap(pair)
-        kappa_geom = J_bar_geom / max(L_i * omega_orb, 1.0e-300)
-        theta = np.arccos(np.clip(x, -1.0, 1.0))
-        sin_theta = max(np.sin(theta), 1.0e-15)
-        return (
-            -0.5
-            * pair.mass_prefactor()
-            * kappa_geom
-            * omega_orb
-            * (np.cos(theta) / sin_theta)
-        )
-
-    def _hamiltonian_from_omega(self, pair: OrbitPair) -> float:
-        """Recover the Hamiltonian by integrating the asymptotic frequency."""
-
-        x = pair.cos_inclination
-        if abs(x - 1.0) < 1.0e-12:
-            return 0.0
-
-        def integrand(u: float) -> float:
-            """Integrand for reconstructing the Hamiltonian from ``Omega``."""
-
-            return -pair.angular_momentum_primary * self._omega_scalar(pair, u)
-
-        val, _ = quad(
-            integrand,
-            1.0,
-            x,
-            epsabs=self.quad_epsabs,
-            epsrel=self.quad_epsrel,
-            limit=200,
-        )
-        return float(val)
 
     def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
         """Return the asymptotic interaction result for ``pair``."""
@@ -1524,25 +1799,37 @@ class AsymptoticEvaluator(BaseEvaluator):
                 hamiltonian=float(cached["hamiltonian"]),
                 omega=float(cached["omega"]),
                 torque=float(cached["torque"]),
+                series_ell=cached.get("series_ell"),
+                series_coefficients=cached.get("series_coefficients"),
                 method=self.method_name,
             )
 
-        omega = self._omega_scalar(pair, pair.cos_inclination)
-        hamiltonian = self._hamiltonian_from_omega(pair)
-        torque = pair.torque_from_omega(omega)
+        components = asymptotic_components(
+            pair,
+            self.ell_max,
+            self.quad_epsabs,
+            self.quad_epsrel,
+        )
+        series_data = _evaluate_legendre_series(pair, components.ells, components.geometry)
 
         result = InteractionResult(
-            hamiltonian=hamiltonian,
-            omega=omega,
-            torque=torque,
+            hamiltonian=series_data.hamiltonian,
+            omega=series_data.omega,
+            torque=series_data.torque,
+            series_ell=series_data.ells,
+            series_coefficients=series_data.physical_coefficients,
             method=self.method_name,
         )
 
         pair.cache_dynamics(
             self.method_name,
-            hamiltonian=hamiltonian,
-            omega=omega,
-            torque=torque,
+            hamiltonian=series_data.hamiltonian,
+            omega=series_data.omega,
+            torque=series_data.torque,
+            series_ell=series_data.ells,
+            series_coefficients=series_data.physical_coefficients,
+            asymptotic_kernel_H=components.h_kernel,
+            asymptotic_kernel_Omega=components.omega_kernel,
         )
 
         return result
@@ -1566,42 +1853,6 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             raise ValueError("The correction order must be at least 2.")
         self.lmax_correction = lmax_correction
 
-    def _asymptotic_J(self, pair: OrbitPair, ell: int | np.ndarray) -> float | np.ndarray:
-        """Return the geometry-only asymptotic approximation of ``J_{ijℓ}``."""
-
-        ell_arr = np.asarray(ell, dtype=int)
-        if ell_arr.size == 0:
-            return np.asarray(ell_arr, dtype=float)
-
-        ell_flat = ell_arr.reshape(-1)
-        result_flat = np.zeros_like(ell_flat, dtype=float)
-        safe_ell = np.where(ell_flat == 0, np.inf, ell_flat.astype(float))
-
-        tag = pair.circular_configuration
-        if tag == "both":
-            return _to_output(result_flat.reshape(ell_arr.shape))
-
-        if tag in {"inner", "outer"} and pair.non_overlapping:
-            z = pair.z_parameter
-            ecc_orbit = pair.outer if tag == "inner" else pair.inner
-            a_out = pair.outer.a
-            geom_prefactor = (
-                (1.0 / a_out)
-                * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
-                * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
-            )
-            result_flat = geom_prefactor * (z ** ell_flat) / (safe_ell ** 1.5)
-            return _to_output(result_flat.reshape(ell_arr.shape))
-
-        if pair.non_overlapping:
-            J_bar = Jbar_ecc_nonoverlap(pair)
-            result_flat = J_bar / (safe_ell ** 2)
-        else:
-            J_bar = Jbar_ecc_overlap(pair)
-            result_flat = J_bar / (safe_ell ** 2)
-
-        return _to_output(result_flat.reshape(ell_arr.shape))
-
     def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
         """Return the hybrid interaction result for ``pair``."""
 
@@ -1620,40 +1871,69 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
                 method=self.method_name,
             )
 
-        base_result = super().evaluate_pair(pair)
+        components = asymptotic_components(
+            pair,
+            self.ell_max,
+            self.quad_epsabs,
+            self.quad_epsrel,
+        )
+
         ells = even_ells(self.lmax_correction)
         if ells.size == 0:
-            return base_result
+            omega = components.omega_kernel
+            torque = pair.torque_from_omega(omega)
+            empty = np.zeros(0, dtype=float)
+            result = InteractionResult(
+                hamiltonian=components.h_kernel,
+                omega=omega,
+                torque=torque,
+                series_ell=ells,
+                series_coefficients=empty,
+                method=self.method_name,
+            )
+            pair.cache_dynamics(
+                self.method_name,
+                hamiltonian=components.h_kernel,
+                omega=omega,
+                torque=torque,
+                series_ell=ells,
+                series_coefficients=empty,
+            )
+            return result
 
         geom_exact = pair.get_couplings("exact:J_exact", ells, J_exact)
         geom_asym = pair.get_couplings(
-            "asymptotic:approximation",
+            f"asymptotic:{components.regime}",
             ells,
-            self._asymptotic_J,
-        )
-        geom_delta = geom_exact - geom_asym
-        mass = pair.mass_prefactor()
-        P_vals = np.asarray(legendre_P(ells, pair.cos_inclination), dtype=float)
-        P_prime_vals = np.asarray(
-            legendre_P_derivative(ells, pair.cos_inclination), dtype=float
+            _compute_asymptotic_couplings,
+            regime=components.regime,
+            tag=components.tag,
         )
 
-        delta_H_geom = float(np.dot(geom_delta, P_vals))
-        delta_dH_dx_geom = float(np.dot(geom_delta, P_prime_vals))
-        delta_H = mass * delta_H_geom
-        delta_dH_dx = mass * delta_dH_dx_geom
+        exact_series = _evaluate_legendre_series(pair, ells, geom_exact)
+        asymp_series = _evaluate_legendre_series(pair, ells, geom_asym)
 
-        L_i = max(pair.angular_momentum_primary, 1.0e-300)
-        omega = base_result.omega - delta_dH_dx / L_i
+        hamiltonian = (
+            components.h_kernel
+            + exact_series.hamiltonian
+            - asymp_series.hamiltonian
+        )
+        omega = (
+            components.omega_kernel
+            + exact_series.omega
+            - asymp_series.omega
+        )
         torque = pair.torque_from_omega(omega)
-        hamiltonian = base_result.hamiltonian + delta_H
+
+        mass = pair.mass_prefactor()
+        series_coefficients = mass * (geom_exact - geom_asym)
 
         result = InteractionResult(
             hamiltonian=hamiltonian,
             omega=omega,
             torque=torque,
             series_ell=ells,
-            series_coefficients=mass * geom_delta,
+            series_coefficients=series_coefficients,
             method=self.method_name,
         )
 
@@ -1663,7 +1943,7 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             omega=omega,
             torque=torque,
             series_ell=ells,
-            series_coefficients=mass * geom_delta,
+            series_coefficients=series_coefficients,
         )
 
         return result
