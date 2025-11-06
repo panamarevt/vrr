@@ -132,6 +132,12 @@ class OrbitPair:
         return float(np.sqrt(max(1.0 - self.cos_inclination ** 2, 0.0)))
 
     @property
+    def mass_prefactor(self) -> float:
+        """Return the interaction mass scaling ``G m_i m_j``."""
+
+        return float(self.G * self.primary.m * self.secondary.m)
+
+    @property
     def non_overlapping(self) -> bool:
         """Return ``True`` if the orbital annuli do not overlap."""
 
@@ -489,7 +495,7 @@ def J_exact(
     nodes: int = 200,
     ecc_tol: float = 1.0e-3,
 ) -> float | np.ndarray:
-    """Return the exact coupling coefficient ``J_{ijℓ}``."""
+    """Return the geometry-only coupling ``J_{ijℓ}`` for ``pair``."""
 
     ell_arr = np.asarray(ell, dtype=int)
     if ell_arr.size == 0:
@@ -502,29 +508,21 @@ def J_exact(
 
     a_inner = pair.inner.a
     a_outer = max(pair.outer.a, 1.0e-300)
-    mass_factor = pair.G * pair.primary.m * pair.secondary.m
 
-    values = mass_factor * s_val * (leg0 ** 2) * (a_inner ** ell_arr) / (a_outer ** (ell_arr + 1))
-    values = np.asarray(values, dtype=float).reshape(ell_arr.shape)
-    return _to_output(values)
+    values = s_val * (leg0 ** 2) * (a_inner ** ell_arr) / (a_outer ** (ell_arr + 1))
+    return _to_output(values.reshape(ell_arr.shape))
 
 
 def J_series(
-    m_i: float,
-    m_j: float,
-    a_i: float,
-    a_j: float,
-    e_i: float,
-    e_j: float,
+    pair: OrbitPair,
     ells: Sequence[int],
     *,
-    G: float = 1.0,
     use_sijl: bool = True,
     s_method: str = "auto",
     N_overlap: int = 200,
     ecc_tol: float = 1.0e-3,
 ) -> np.ndarray:
-    """Return ``J_{ijℓ}`` for multipole indices ``ℓ`` (Legendre order ``L = 2ℓ``)."""
+    """Return geometry-only ``J_{ijℓ}`` for multipole indices ``ℓ``."""
 
     ell_arr = np.asarray(ells, dtype=int)
     if ell_arr.size == 0:
@@ -532,31 +530,29 @@ def J_series(
 
     L_arr = 2 * ell_arr
 
-    primary = Orbit(a_i, e_i, m_i)
-    secondary = Orbit(a_j, e_j, m_j)
-    pair = OrbitPair(primary, secondary, cos_inclination=1.0, G=G)
-
     if not use_sijl:
         # fall back to s_ℓ = 1 while keeping the geometry consistent
         s_vals = np.ones_like(ell_arr, dtype=float)
         leg0 = np.asarray(legendre_P_zero(L_arr), dtype=float)
-        a_in = min(a_i, a_j)
-        a_out = max(a_i, a_j)
-        pref = G * m_i * m_j
+        a_in = pair.inner.a
+        a_out = pair.outer.a
         numer = a_in ** L_arr
-        denom = a_out ** (L_arr + 1)
-        return pref * s_vals * (leg0 ** 2) * numer / denom
+        denom = np.maximum(a_out, 1.0e-300) ** (L_arr + 1)
+        geom = s_vals * (leg0 ** 2) * numer / denom
+    else:
+        geom = np.asarray(
+            J_exact(
+                pair,
+                L_arr,
+                method=s_method,
+                nodes=N_overlap,
+                ecc_tol=ecc_tol,
+            ),
+            dtype=float,
+        )
 
-    return np.asarray(
-        J_exact(
-            pair,
-            L_arr,
-            method=s_method,
-            nodes=N_overlap,
-            ecc_tol=ecc_tol,
-        ),
-        dtype=float,
-    )
+    geom = np.asarray(geom, dtype=float).reshape(ell_arr.shape)
+    return geom
 
 
 def H_terms(ells: Sequence[int], J_ell: np.ndarray, cos_theta: float) -> np.ndarray:
@@ -735,17 +731,20 @@ def contiguous_segments(mask: Sequence[bool]) -> list[tuple[int, int]]:
 
 
 def Jbar_ecc_nonoverlap(pair: OrbitPair) -> float:
-    """Return the non-overlapping eccentric asymptotic coupling ``\bar{J}``."""
+    """Return the geometry-only non-overlap asymptotic coupling ``\bar{J}``."""
+
+    # Multiply the result by :attr:`OrbitPair.mass_prefactor` for the physical value.
 
     inner, outer = pair.inner, pair.outer
-    prefactor = pair.G * pair.primary.m * pair.secondary.m / (np.pi * np.pi)
     ratio = ((1.0 + inner.e) * (1.0 - outer.e)) ** 1.5
     denom = np.sqrt(max(inner.e * outer.e, 1.0e-300))
-    return float(prefactor * ratio / denom / outer.periapsis)
+    return float(ratio / (np.pi ** 2 * denom * outer.periapsis))
 
 
 def Jbar_ecc_overlap(pair: OrbitPair) -> float:
-    """Return the overlapping eccentric asymptotic coupling ``\bar{J}``."""
+    """Return the geometry-only overlapping asymptotic coupling ``\bar{J}``."""
+
+    # Multiply the result by :attr:`OrbitPair.mass_prefactor` for the physical value.
 
     inner, outer = pair.inner, pair.outer
     a = min(inner.periapsis, outer.periapsis)
@@ -753,8 +752,7 @@ def Jbar_ecc_overlap(pair: OrbitPair) -> float:
     c = min(inner.apoapsis, outer.apoapsis)
     d = max(inner.apoapsis, outer.apoapsis)
     integral = I2_numeric(a, b, c, d)
-    prefactor = 4.0 * pair.G * pair.primary.m * pair.secondary.m
-    return float(prefactor * integral / (np.pi ** 3 * inner.a * outer.a))
+    return float(4.0 * integral / (np.pi ** 3 * inner.a * outer.a))
 
 
 # ---------------------------------------------------------------------------
@@ -813,13 +811,7 @@ def _series_from_meta(ell_arr: np.ndarray, meta: AsymptoticMetadata) -> Optional
 
 def asymp_J_for_eta(
     ells,
-    G,
-    mi,
-    mj,
-    ai,
-    e_i,
-    aj,
-    e_j,
+    pair: OrbitPair,
     *,
     use_overlap=False,
     I2_func=None,
@@ -830,7 +822,10 @@ def asymp_J_for_eta(
     """Return asymptotic ``J_{ijℓ}`` values (optionally with metadata)."""
 
     ell_arr = np.asarray([] if ells is None else ells, dtype=int)
-    pair = _build_pair(ai, e_i, mi, aj, e_j, mj, G=G)
+    ai = pair.primary.a
+    aj = pair.secondary.a
+    e_i = pair.primary.e
+    e_j = pair.secondary.e
     case = _classify_circular(pair.primary.e, pair.secondary.e, eccentricity_tol)
     regime = "overlap" if use_overlap else "non_overlap"
 
@@ -844,7 +839,7 @@ def asymp_J_for_eta(
         outer = pair.outer
         inner = pair.inner
         if outer.a > 0.0:
-            prefactor = (G * mi * mj) / outer.a
+            prefactor = 1.0 / outer.a
             z_value = inner.a / outer.a
             ell_power = 1.0
 
@@ -856,7 +851,7 @@ def asymp_J_for_eta(
                 ecc_orbit = pair.secondary if circ_primary else pair.primary
                 ecc = ecc_orbit.e
                 prefactor = (
-                    (G * mi * mj) / outer.a
+                    (1.0 / outer.a)
                     * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
                     * np.sqrt(max(1.0 - ecc, 0.0) / max(abs(ecc), 1.0e-300))
                 )
@@ -878,14 +873,18 @@ def asymp_J_for_eta(
             elif I2_func is not None:
                 I2_val = float(I2_func(ai, e_i, aj, e_j))
             if I2_val is not None:
-                prefactor = (4.0 / (np.pi ** 3)) * (G * mi * mj) / (pair.primary.a * pair.secondary.a) * I2_val
+                prefactor = (
+                    (4.0 / (np.pi ** 3))
+                    * I2_val
+                    / (pair.primary.a * pair.secondary.a)
+                )
                 z_value = 1.0
                 kernel_supported = True
         else:
             rp_out = max(outer_ap.periapsis, 1.0e-300)
             ra_in = inner_ap.apoapsis
             prefactor = (
-                (G * mi * mj) / (np.pi ** 2)
+                (1.0 / (np.pi ** 2))
                 * ((1.0 + inner_ap.e) * (1.0 - outer_ap.e)) ** 1.5
                 / np.sqrt(max(inner_ap.e, 1.0e-300) * max(outer_ap.e, 1.0e-300))
                 * (1.0 / rp_out)
@@ -942,9 +941,6 @@ def _kernel_z1_cot_RHS(x: float) -> float:
 def omega_kernel_normalized(
     meta: AsymptoticMetadata,
     cos_theta: float,
-    G: float,
-    mi: float,
-    mj: float,
     *,
     a_outer: float = 1.0,
     use_cot_approx: bool = False,
@@ -956,7 +952,7 @@ def omega_kernel_normalized(
         return np.nan
 
     x = float(np.clip(cos_theta, -1.0, 1.0))
-    scale = (a_outer * meta.prefactor) / (G * mi * mj)
+    scale = a_outer * meta.prefactor
 
     if meta.case == "both_circular":
         return np.nan
@@ -995,9 +991,6 @@ def omega_hybrid_from_meta(
     cos_theta: float,
     L_i: float,
     *,
-    G: float,
-    mi: float,
-    mj: float,
     a_outer: float,
     use_cot_approx: bool = False,
 ) -> Optional[tuple[float, np.ndarray, np.ndarray, float]]:
@@ -1012,9 +1005,6 @@ def omega_hybrid_from_meta(
     kernel_val = omega_kernel_normalized(
         meta,
         cos_theta,
-        G,
-        mi,
-        mj,
         a_outer=a_outer,
         use_cot_approx=use_cot_approx,
         signed=True,
@@ -1032,9 +1022,6 @@ def kernel_line_Omega_normalized(
     e_i: float,
     e_j: float,
     cos_theta: float,
-    G: float,
-    mi: float,
-    mj: float,
     *,
     I2_func=None,
     use_cot_approx: bool = False,
@@ -1053,15 +1040,10 @@ def kernel_line_Omega_normalized(
 
         ai = eta_val * a_j
         use_overlap = bool(over_mask[idx] or emb_mask[idx])
+        pair = _build_pair(ai, e_i, 1.0, a_j, e_j, 1.0)
         _, meta = asymp_J_for_eta(
             None,
-            G,
-            mi,
-            mj,
-            ai,
-            e_i,
-            a_j,
-            e_j,
+            pair,
             use_overlap=use_overlap,
             I2_func=I2_func if use_overlap else None,
             return_meta=True,
@@ -1069,9 +1051,6 @@ def kernel_line_Omega_normalized(
         out[idx] = omega_kernel_normalized(
             meta,
             cos_theta,
-            G,
-            mi,
-            mj,
             a_outer=a_j,
             use_cot_approx=use_cot_approx,
             signed=return_signed,
@@ -1190,7 +1169,7 @@ class ExactSeriesEvaluator(BaseEvaluator):
         if series_ell.size == 0:
             return InteractionResult(0.0, 0.0, 0.0, method=self.method_name)
 
-        J_vals = np.asarray(
+        geom_vals = np.asarray(
             J_exact(
                 pair,
                 series_ell,
@@ -1201,21 +1180,30 @@ class ExactSeriesEvaluator(BaseEvaluator):
             dtype=float,
         )
 
+        mass = pair.mass_prefactor
+
         cos_inc = pair.cos_inclination
         P_vals = np.asarray(legendre_P(series_ell, cos_inc), dtype=float)
-        h_terms = J_vals * P_vals
-        h_partial = np.cumsum(h_terms)
-        hamiltonian = float(h_partial[-1])
+        h_terms_geom = geom_vals * P_vals
+        h_partial_geom = np.cumsum(h_terms_geom)
+        hamiltonian = float(mass * h_partial_geom[-1])
 
         P_prime_vals = np.asarray(legendre_P_derivative(series_ell, cos_inc), dtype=float)
-        gradient_terms = J_vals * P_prime_vals
-        dH_dx = float(np.sum(gradient_terms))
+        gradient_geom = geom_vals * P_prime_vals
+        dH_dx_geom = float(np.sum(gradient_geom))
+        dH_dx = mass * dH_dx_geom
 
         L_i = max(pair.angular_momentum_primary, 1.0e-300)
-        omega_terms = -gradient_terms / L_i
-        omega_partial = np.cumsum(omega_terms)
-        omega = float(omega_partial[-1])
+        omega_terms_geom = -gradient_geom / L_i
+        omega_partial_geom = np.cumsum(omega_terms_geom)
+        omega = float(mass * omega_partial_geom[-1])
         torque = dH_dx * pair.sin_inclination
+
+        J_vals = mass * geom_vals
+        h_terms = mass * h_terms_geom
+        h_partial = mass * h_partial_geom
+        omega_terms = mass * omega_terms_geom
+        omega_partial = mass * omega_partial_geom
 
         return InteractionResult(
             hamiltonian=hamiltonian,
@@ -1266,33 +1254,47 @@ class AsymptoticEvaluator(BaseEvaluator):
             if pair.non_overlapping:
                 ecc_orbit = pair.outer if tag == "inner" else pair.inner
                 a_out = pair.outer.a
-                prefactor = (
-                    pair.G
-                    * pair.primary.m
-                    * pair.secondary.m
-                    / a_out
+                geom_prefactor = (
+                    (1.0 / a_out)
                     * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
                     * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
                 )
-                dH_dx = prefactor * S2_even_integral_kernel(x, z)
-                return -dH_dx / L_i
+                dH_dx_geom = geom_prefactor * S2_even_integral_kernel(x, z)
+                return -(pair.mass_prefactor * dH_dx_geom) / L_i
 
-            J_bar = Jbar_ecc_overlap(pair)
-            kappa = J_bar / max(L_i * omega_orb, 1.0e-300)
+            J_bar_geom = Jbar_ecc_overlap(pair)
+            kappa_geom = J_bar_geom / max(L_i * omega_orb, 1.0e-300)
             theta = np.arccos(np.clip(x, -1.0, 1.0))
             sin_theta = max(np.sin(theta), 1.0e-15)
-            return -0.5 * kappa * omega_orb * (np.cos(theta) / sin_theta)
+            return (
+                -0.5
+                * pair.mass_prefactor
+                * kappa_geom
+                * omega_orb
+                * (np.cos(theta) / sin_theta)
+            )
 
         if pair.non_overlapping:
-            J_bar = Jbar_ecc_nonoverlap(pair)
-            kappa = J_bar / max(L_i * omega_orb, 1.0e-300)
-            return -kappa * omega_orb * Sprime_ecc_kernel(x, z)
+            J_bar_geom = Jbar_ecc_nonoverlap(pair)
+            kappa_geom = J_bar_geom / max(L_i * omega_orb, 1.0e-300)
+            return (
+                -pair.mass_prefactor
+                * kappa_geom
+                * omega_orb
+                * Sprime_ecc_kernel(x, z)
+            )
 
-        J_bar = Jbar_ecc_overlap(pair)
-        kappa = J_bar / max(L_i * omega_orb, 1.0e-300)
+        J_bar_geom = Jbar_ecc_overlap(pair)
+        kappa_geom = J_bar_geom / max(L_i * omega_orb, 1.0e-300)
         theta = np.arccos(np.clip(x, -1.0, 1.0))
         sin_theta = max(np.sin(theta), 1.0e-15)
-        return -0.5 * kappa * omega_orb * (np.cos(theta) / sin_theta)
+        return (
+            -0.5
+            * pair.mass_prefactor
+            * kappa_geom
+            * omega_orb
+            * (np.cos(theta) / sin_theta)
+        )
 
     def _hamiltonian_from_omega(self, pair: OrbitPair) -> float:
         """Recover the Hamiltonian by integrating the asymptotic frequency."""
@@ -1349,7 +1351,7 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
         self.lmax_correction = lmax_correction
 
     def _asymptotic_J(self, pair: OrbitPair, ell: int | np.ndarray) -> float | np.ndarray:
-        """Return the asymptotic approximation of ``J_{ijℓ}``."""
+        """Return the geometry-only asymptotic approximation of ``J_{ijℓ}``."""
 
         ell_arr = np.asarray(ell, dtype=int)
         if ell_arr.size == 0:
@@ -1367,15 +1369,12 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             z = pair.z_parameter
             ecc_orbit = pair.outer if tag == "inner" else pair.inner
             a_out = pair.outer.a
-            prefactor = (
-                pair.G
-                * pair.primary.m
-                * pair.secondary.m
-                / a_out
+            geom_prefactor = (
+                (1.0 / a_out)
                 * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
                 * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
             )
-            result_flat = prefactor * (z ** ell_flat) / (safe_ell ** 1.5)
+            result_flat = geom_prefactor * (z ** ell_flat) / (safe_ell ** 1.5)
             return _to_output(result_flat.reshape(ell_arr.shape))
 
         if pair.non_overlapping:
@@ -1395,16 +1394,22 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
         if ells.size == 0:
             return base_result
 
-        delta_J = np.asarray(J_exact(pair, ells), dtype=float) - np.asarray(
-            self._asymptotic_J(pair, ells), dtype=float
+        geom_exact = np.asarray(J_exact(pair, ells), dtype=float)
+        geom_asym = np.asarray(
+            self._asymptotic_J(pair, ells),
+            dtype=float,
         )
+        geom_delta = geom_exact - geom_asym
+        mass = pair.mass_prefactor
         P_vals = np.asarray(legendre_P(ells, pair.cos_inclination), dtype=float)
         P_prime_vals = np.asarray(
             legendre_P_derivative(ells, pair.cos_inclination), dtype=float
         )
 
-        delta_H = float(np.dot(delta_J, P_vals))
-        delta_dH_dx = float(np.dot(delta_J, P_prime_vals))
+        delta_H_geom = float(np.dot(geom_delta, P_vals))
+        delta_dH_dx_geom = float(np.dot(geom_delta, P_prime_vals))
+        delta_H = mass * delta_H_geom
+        delta_dH_dx = mass * delta_dH_dx_geom
 
         L_i = max(pair.angular_momentum_primary, 1.0e-300)
         omega = base_result.omega - delta_dH_dx / L_i
@@ -1416,7 +1421,7 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             omega=omega,
             torque=torque,
             series_ell=ells,
-            series_coefficients=delta_J,
+            series_coefficients=mass * geom_delta,
             method=self.method_name,
         )
 
