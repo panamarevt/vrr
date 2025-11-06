@@ -48,13 +48,13 @@ class CouplingPrefactorTests(unittest.TestCase):
 
         np.testing.assert_allclose(geom_scaled, geom, rtol=1.0e-12, atol=1.0e-12)
 
-        physical = pair.mass_prefactor * geom
-        physical_scaled = scaled_pair.mass_prefactor * geom_scaled
+        physical = pair.mass_prefactor() * geom
+        physical_scaled = scaled_pair.mass_prefactor() * geom_scaled
 
         nonzero = np.abs(physical) > 1.0e-14
         self.assertTrue(np.any(nonzero))
 
-        ratio_expected = scaled_pair.mass_prefactor / pair.mass_prefactor
+        ratio_expected = scaled_pair.mass_prefactor() / pair.mass_prefactor()
         ratio_observed = physical_scaled[nonzero] / physical[nonzero]
 
         np.testing.assert_allclose(
@@ -82,7 +82,7 @@ class CouplingPrefactorTests(unittest.TestCase):
             / outer.periapsis
         )
 
-        self.assertAlmostEqual(pair.mass_prefactor * geom_val, expected, places=12)
+        self.assertAlmostEqual(pair.mass_prefactor() * geom_val, expected, places=12)
 
     def test_overlap_jbar_scaling(self) -> None:
         """The overlapping asymptotic coupling rescales with the mass prefactor."""
@@ -108,7 +108,7 @@ class CouplingPrefactorTests(unittest.TestCase):
             / (math.pi ** 3 * inner.a * outer.a)
         )
 
-        self.assertAlmostEqual(pair.mass_prefactor * geom_val, expected, places=12)
+        self.assertAlmostEqual(pair.mass_prefactor() * geom_val, expected, places=12)
 
 
 if __name__ == "__main__":
