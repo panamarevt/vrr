@@ -13,7 +13,7 @@ efficiently.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 import numpy as np
 import scipy.special as sp
@@ -81,13 +81,38 @@ class OrbitPair:
     M_central: float = 1.0
 
     def __post_init__(self) -> None:
-        """Validate inputs and pre-compute helper state."""
+        """Validate inputs and initialise lazy caches."""
 
         self.cos_inclination = float(np.clip(self.cos_inclination, -1.0, 1.0))
         if self.G <= 0:
             raise ValueError("The gravitational constant must be positive.")
         if self.M_central <= 0:
             raise ValueError("The central mass must be positive.")
+
+        self._update_orbit_ordering()
+
+        # Lazy caches populated on demand.  The geometry cache stores
+        # geometry-only quantities such as J_{ijℓ}, while the dynamics cache
+        # keeps track of Hamiltonian, Omega and torque values keyed by the
+        # evaluator/mode that produced them.
+        self._geometry_cache: dict[tuple[Any, ...], np.ndarray] = {}
+        self._dynamics_cache: dict[str, dict[str, Any]] = {}
+        self._mass_prefactor_cache: Optional[float] = None
+
+        # Signatures used to invalidate the caches when the orbital elements
+        # or the orientation of the pair change.  They are initialised with the
+        # current state so that the first cache access operates on a clean
+        # slate.
+        self._geometry_signature: Optional[tuple[float, ...]] = None
+        self._dynamics_signature: Optional[tuple[float, ...]] = None
+        self._geometry_signature = self._compute_geometry_signature()
+        self._dynamics_signature = self._compute_dynamics_signature()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _update_orbit_ordering(self) -> None:
+        """Assign cached inner/outer orbits for fast access."""
 
         if self.primary.a <= self.secondary.a:
             self._inner = self.primary
@@ -97,6 +122,56 @@ class OrbitPair:
             self._inner = self.secondary
             self._outer = self.primary
             self._primary_is_inner = False
+
+    def _compute_geometry_signature(self) -> tuple[float, ...]:
+        """Return a hashable signature for geometry-dependent caches."""
+
+        return (
+            float(self.primary.a),
+            float(self.primary.e),
+            float(self.primary.m),
+            float(self.secondary.a),
+            float(self.secondary.e),
+            float(self.secondary.m),
+            float(self.G),
+            float(self.M_central),
+        )
+
+    def _compute_dynamics_signature(self) -> tuple[float, ...]:
+        """Return a signature for orientation dependent caches."""
+
+        geom_signature = self._compute_geometry_signature()
+        return (*geom_signature, float(self.cos_inclination))
+
+    def _clear_geometry_cache(self) -> None:
+        """Remove geometry-only cached data."""
+
+        self._geometry_cache.clear()
+        self._mass_prefactor_cache = None
+
+    def _clear_dynamics_cache(self) -> None:
+        """Remove cached Hamiltonian, Omega and torque values."""
+
+        self._dynamics_cache.clear()
+
+    def _ensure_geometry_signature(self) -> None:
+        """Refresh geometry caches when the orbital elements change."""
+
+        signature = self._compute_geometry_signature()
+        if signature != self._geometry_signature:
+            self._geometry_signature = signature
+            self._update_orbit_ordering()
+            self._clear_geometry_cache()
+            self._clear_dynamics_cache()
+
+    def _ensure_dynamics_signature(self) -> None:
+        """Refresh orientation caches when the inclination changes."""
+
+        self._ensure_geometry_signature()
+        signature = self._compute_dynamics_signature()
+        if signature != self._dynamics_signature:
+            self._dynamics_signature = signature
+            self._clear_dynamics_cache()
 
     # ------------------------------------------------------------------
     # Convenience properties
@@ -132,12 +207,6 @@ class OrbitPair:
         return float(np.sqrt(max(1.0 - self.cos_inclination ** 2, 0.0)))
 
     @property
-    def mass_prefactor(self) -> float:
-        """Return the interaction mass scaling ``G m_i m_j``."""
-
-        return float(self.G * self.primary.m * self.secondary.m)
-
-    @property
     def non_overlapping(self) -> bool:
         """Return ``True`` if the orbital annuli do not overlap."""
 
@@ -158,6 +227,98 @@ class OrbitPair:
         """Return the semi-major-axis ratio ``alpha = a_in / a_out``."""
 
         return self.inner.a / self.outer.a
+
+    # ------------------------------------------------------------------
+    # Cached accessors
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_hashable(value: Any) -> Any:
+        """Convert ``value`` into a hashable representation for cache keys."""
+
+        if isinstance(value, np.ndarray):
+            return tuple(np.asarray(value).reshape(-1).tolist())
+        if isinstance(value, (list, tuple)):
+            return tuple(OrbitPair._to_hashable(item) for item in value)
+        return value
+
+    def mass_prefactor(self) -> float:
+        """Return the interaction mass scaling ``G m_i m_j`` (cached)."""
+
+        self._ensure_geometry_signature()
+        if self._mass_prefactor_cache is None:
+            self._mass_prefactor_cache = float(
+                self.G * self.primary.m * self.secondary.m
+            )
+        return self._mass_prefactor_cache
+
+    def torque_prefactor(self) -> float:
+        """Return the factor multiplying ``Omega`` to obtain the torque."""
+
+        self._ensure_dynamics_signature()
+        return -self.angular_momentum_primary * self.sin_inclination
+
+    def torque_from_omega(self, omega: float) -> float:
+        """Return the torque corresponding to the supplied ``Omega``."""
+
+        return self.torque_prefactor() * float(omega)
+
+    def get_couplings(
+        self,
+        mode: str,
+        ells: Sequence[int],
+        compute: Optional[
+            Callable[["OrbitPair", np.ndarray], np.ndarray | float]
+        ] = None,
+        **compute_kwargs: Any,
+    ) -> np.ndarray:
+        """Return geometry-only couplings for ``ells`` using lazy caching."""
+
+        self._ensure_geometry_signature()
+        ell_arr = np.asarray(ells, dtype=int)
+        ell_tuple = tuple(int(x) for x in ell_arr.reshape(-1))
+        extra = tuple(
+            sorted((key, OrbitPair._to_hashable(val)) for key, val in compute_kwargs.items())
+        )
+        cache_key = (mode, ell_tuple, extra)
+
+        if cache_key not in self._geometry_cache:
+            if compute is None:
+                raise ValueError(
+                    "No cached couplings available and no compute function provided."
+                )
+            computed = compute(self, ell_arr, **compute_kwargs)
+            values = np.asarray(computed, dtype=float).reshape(-1)
+            self._geometry_cache[cache_key] = values.copy()
+
+        cached = self._geometry_cache[cache_key]
+        return np.array(cached, copy=True).reshape(ell_arr.shape)
+
+    def cache_dynamics(self, mode: str, **values: Any) -> None:
+        """Store Hamiltonian, Omega and torque results for ``mode``."""
+
+        self._ensure_dynamics_signature()
+        entry = self._dynamics_cache.setdefault(mode, {})
+        for key, value in values.items():
+            if isinstance(value, np.ndarray):
+                entry[key] = np.array(value, copy=True)
+            else:
+                entry[key] = value
+
+    def get_cached_dynamics(self, mode: str) -> Optional[dict[str, Any]]:
+        """Return cached dynamical quantities for ``mode`` if available."""
+
+        self._ensure_dynamics_signature()
+        entry = self._dynamics_cache.get(mode)
+        if entry is None:
+            return None
+
+        result: dict[str, Any] = {}
+        for key, value in entry.items():
+            if isinstance(value, np.ndarray):
+                result[key] = np.array(value, copy=True)
+            else:
+                result[key] = value
+        return result
 
     @property
     def circular_configuration(self) -> Optional[str]:
@@ -733,7 +894,7 @@ def contiguous_segments(mask: Sequence[bool]) -> list[tuple[int, int]]:
 def Jbar_ecc_nonoverlap(pair: OrbitPair) -> float:
     """Return the geometry-only non-overlap asymptotic coupling ``\bar{J}``."""
 
-    # Multiply the result by :attr:`OrbitPair.mass_prefactor` for the physical value.
+    # Multiply the result by :meth:`OrbitPair.mass_prefactor` for the physical value.
 
     inner, outer = pair.inner, pair.outer
     ratio = ((1.0 + inner.e) * (1.0 - outer.e)) ** 1.5
@@ -744,7 +905,7 @@ def Jbar_ecc_nonoverlap(pair: OrbitPair) -> float:
 def Jbar_ecc_overlap(pair: OrbitPair) -> float:
     """Return the geometry-only overlapping asymptotic coupling ``\bar{J}``."""
 
-    # Multiply the result by :attr:`OrbitPair.mass_prefactor` for the physical value.
+    # Multiply the result by :meth:`OrbitPair.mass_prefactor` for the physical value.
 
     inner, outer = pair.inner, pair.outer
     a = min(inner.periapsis, outer.periapsis)
@@ -1165,22 +1326,39 @@ class ExactSeriesEvaluator(BaseEvaluator):
     def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
         """Evaluate the Hamiltonian, frequency and torque for ``pair``."""
 
+        cached = pair.get_cached_dynamics(self.method_name)
+        if cached is not None and {
+            "hamiltonian",
+            "omega",
+            "torque",
+        }.issubset(cached):
+            return InteractionResult(
+                hamiltonian=float(cached["hamiltonian"]),
+                omega=float(cached["omega"]),
+                torque=float(cached["torque"]),
+                series_ell=cached.get("series_ell"),
+                series_coefficients=cached.get("series_coefficients"),
+                hamiltonian_terms=cached.get("hamiltonian_terms"),
+                hamiltonian_partial_sums=cached.get("hamiltonian_partial_sums"),
+                omega_terms=cached.get("omega_terms"),
+                omega_partial_sums=cached.get("omega_partial_sums"),
+                method=self.method_name,
+            )
+
         series_ell = even_ells(self.ell_max, start=0)
         if series_ell.size == 0:
             return InteractionResult(0.0, 0.0, 0.0, method=self.method_name)
 
-        geom_vals = np.asarray(
-            J_exact(
-                pair,
-                series_ell,
-                method=self.s_method,
-                nodes=self.overlap_nodes,
-                ecc_tol=self.eccentricity_tol,
-            ),
-            dtype=float,
+        geom_vals = pair.get_couplings(
+            "exact:J_exact",
+            series_ell,
+            J_exact,
+            method=self.s_method,
+            nodes=self.overlap_nodes,
+            ecc_tol=self.eccentricity_tol,
         )
 
-        mass = pair.mass_prefactor
+        mass = pair.mass_prefactor()
 
         cos_inc = pair.cos_inclination
         P_vals = np.asarray(legendre_P(series_ell, cos_inc), dtype=float)
@@ -1197,7 +1375,7 @@ class ExactSeriesEvaluator(BaseEvaluator):
         omega_terms_geom = -gradient_geom / L_i
         omega_partial_geom = np.cumsum(omega_terms_geom)
         omega = float(mass * omega_partial_geom[-1])
-        torque = dH_dx * pair.sin_inclination
+        torque = pair.torque_from_omega(omega)
 
         J_vals = mass * geom_vals
         h_terms = mass * h_terms_geom
@@ -1205,7 +1383,7 @@ class ExactSeriesEvaluator(BaseEvaluator):
         omega_terms = mass * omega_terms_geom
         omega_partial = mass * omega_partial_geom
 
-        return InteractionResult(
+        result = InteractionResult(
             hamiltonian=hamiltonian,
             omega=omega,
             torque=torque,
@@ -1217,6 +1395,21 @@ class ExactSeriesEvaluator(BaseEvaluator):
             omega_partial_sums=omega_partial,
             method=self.method_name,
         )
+
+        pair.cache_dynamics(
+            self.method_name,
+            hamiltonian=hamiltonian,
+            omega=omega,
+            torque=torque,
+            series_ell=series_ell,
+            series_coefficients=J_vals,
+            hamiltonian_terms=h_terms,
+            hamiltonian_partial_sums=h_partial,
+            omega_terms=omega_terms,
+            omega_partial_sums=omega_partial,
+        )
+
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1260,7 +1453,7 @@ class AsymptoticEvaluator(BaseEvaluator):
                     * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
                 )
                 dH_dx_geom = geom_prefactor * S2_even_integral_kernel(x, z)
-                return -(pair.mass_prefactor * dH_dx_geom) / L_i
+                return -(pair.mass_prefactor() * dH_dx_geom) / L_i
 
             J_bar_geom = Jbar_ecc_overlap(pair)
             kappa_geom = J_bar_geom / max(L_i * omega_orb, 1.0e-300)
@@ -1268,7 +1461,7 @@ class AsymptoticEvaluator(BaseEvaluator):
             sin_theta = max(np.sin(theta), 1.0e-15)
             return (
                 -0.5
-                * pair.mass_prefactor
+                * pair.mass_prefactor()
                 * kappa_geom
                 * omega_orb
                 * (np.cos(theta) / sin_theta)
@@ -1278,7 +1471,7 @@ class AsymptoticEvaluator(BaseEvaluator):
             J_bar_geom = Jbar_ecc_nonoverlap(pair)
             kappa_geom = J_bar_geom / max(L_i * omega_orb, 1.0e-300)
             return (
-                -pair.mass_prefactor
+                -pair.mass_prefactor()
                 * kappa_geom
                 * omega_orb
                 * Sprime_ecc_kernel(x, z)
@@ -1290,7 +1483,7 @@ class AsymptoticEvaluator(BaseEvaluator):
         sin_theta = max(np.sin(theta), 1.0e-15)
         return (
             -0.5
-            * pair.mass_prefactor
+            * pair.mass_prefactor()
             * kappa_geom
             * omega_orb
             * (np.cos(theta) / sin_theta)
@@ -1321,15 +1514,38 @@ class AsymptoticEvaluator(BaseEvaluator):
     def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
         """Return the asymptotic interaction result for ``pair``."""
 
+        cached = pair.get_cached_dynamics(self.method_name)
+        if cached is not None and {
+            "hamiltonian",
+            "omega",
+            "torque",
+        }.issubset(cached):
+            return InteractionResult(
+                hamiltonian=float(cached["hamiltonian"]),
+                omega=float(cached["omega"]),
+                torque=float(cached["torque"]),
+                method=self.method_name,
+            )
+
         omega = self._omega_scalar(pair, pair.cos_inclination)
         hamiltonian = self._hamiltonian_from_omega(pair)
-        torque = -pair.angular_momentum_primary * omega * pair.sin_inclination
-        return InteractionResult(
+        torque = pair.torque_from_omega(omega)
+
+        result = InteractionResult(
             hamiltonian=hamiltonian,
             omega=omega,
             torque=torque,
             method=self.method_name,
         )
+
+        pair.cache_dynamics(
+            self.method_name,
+            hamiltonian=hamiltonian,
+            omega=omega,
+            torque=torque,
+        )
+
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1389,18 +1605,34 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
     def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
         """Return the hybrid interaction result for ``pair``."""
 
+        cached = pair.get_cached_dynamics(self.method_name)
+        if cached is not None and {
+            "hamiltonian",
+            "omega",
+            "torque",
+        }.issubset(cached):
+            return InteractionResult(
+                hamiltonian=float(cached["hamiltonian"]),
+                omega=float(cached["omega"]),
+                torque=float(cached["torque"]),
+                series_ell=cached.get("series_ell"),
+                series_coefficients=cached.get("series_coefficients"),
+                method=self.method_name,
+            )
+
         base_result = super().evaluate_pair(pair)
         ells = even_ells(self.lmax_correction)
         if ells.size == 0:
             return base_result
 
-        geom_exact = np.asarray(J_exact(pair, ells), dtype=float)
-        geom_asym = np.asarray(
-            self._asymptotic_J(pair, ells),
-            dtype=float,
+        geom_exact = pair.get_couplings("exact:J_exact", ells, J_exact)
+        geom_asym = pair.get_couplings(
+            "asymptotic:approximation",
+            ells,
+            self._asymptotic_J,
         )
         geom_delta = geom_exact - geom_asym
-        mass = pair.mass_prefactor
+        mass = pair.mass_prefactor()
         P_vals = np.asarray(legendre_P(ells, pair.cos_inclination), dtype=float)
         P_prime_vals = np.asarray(
             legendre_P_derivative(ells, pair.cos_inclination), dtype=float
@@ -1413,10 +1645,10 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
 
         L_i = max(pair.angular_momentum_primary, 1.0e-300)
         omega = base_result.omega - delta_dH_dx / L_i
-        torque = base_result.torque + delta_dH_dx * pair.sin_inclination
+        torque = pair.torque_from_omega(omega)
         hamiltonian = base_result.hamiltonian + delta_H
 
-        return InteractionResult(
+        result = InteractionResult(
             hamiltonian=hamiltonian,
             omega=omega,
             torque=torque,
@@ -1424,6 +1656,17 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             series_coefficients=mass * geom_delta,
             method=self.method_name,
         )
+
+        pair.cache_dynamics(
+            self.method_name,
+            hamiltonian=hamiltonian,
+            omega=omega,
+            torque=torque,
+            series_ell=ells,
+            series_coefficients=mass * geom_delta,
+        )
+
+        return result
 
 
 __all__ = [
