@@ -31,18 +31,17 @@ class CouplingPrefactorTests(unittest.TestCase):
     def test_exact_coupling_is_geometry_only(self) -> None:
         """``J_exact`` does not depend on ``G`` or the stellar masses."""
 
-        primary = Orbit(a=1.3, e=0.2, m=2.0)
-        secondary = Orbit(a=2.1, e=0.4, m=1.5)
-        pair = OrbitPair(primary, secondary, cos_inclination=0.3, G=0.8)
+        primary = Orbit(a=1.3, e=0.2, m=2.0, G=0.8)
+        secondary = Orbit(a=2.1, e=0.4, m=1.5, G=0.8)
+        pair = OrbitPair(primary, secondary, cos_inclination=0.3)
 
         ells = np.array([2, 4, 6], dtype=int)
         geom = np.asarray(J_exact(pair, ells), dtype=float)
 
         scaled_pair = OrbitPair(
-            Orbit(a=primary.a, e=primary.e, m=5.0),
-            Orbit(a=secondary.a, e=secondary.e, m=3.2),
+            Orbit(a=primary.a, e=primary.e, m=5.0, G=2.3),
+            Orbit(a=secondary.a, e=secondary.e, m=3.2, G=2.3),
             cos_inclination=pair.cos_inclination,
-            G=2.3,
         )
         geom_scaled = np.asarray(J_exact(scaled_pair, ells), dtype=float)
 
@@ -65,9 +64,9 @@ class CouplingPrefactorTests(unittest.TestCase):
     def test_non_overlap_jbar_scaling(self) -> None:
         """The non-overlap asymptotic coupling scales with ``G m_i m_j``."""
 
-        primary = Orbit(a=1.0, e=0.2, m=1.1)
-        secondary = Orbit(a=3.0, e=0.5, m=0.9)
-        pair = OrbitPair(primary, secondary, cos_inclination=0.1, G=0.6)
+        primary = Orbit(a=1.0, e=0.2, m=1.1, G=0.6)
+        secondary = Orbit(a=3.0, e=0.5, m=0.9, G=0.6)
+        pair = OrbitPair(primary, secondary, cos_inclination=0.1)
 
         inner, outer = pair.inner, pair.outer
         geom_val = Jbar_ecc_nonoverlap(pair)
@@ -87,9 +86,9 @@ class CouplingPrefactorTests(unittest.TestCase):
     def test_overlap_jbar_scaling(self) -> None:
         """The overlapping asymptotic coupling rescales with the mass prefactor."""
 
-        primary = Orbit(a=1.0, e=0.6, m=1.0)
-        secondary = Orbit(a=1.6, e=0.3, m=0.7)
-        pair = OrbitPair(primary, secondary, cos_inclination=-0.4, G=1.2)
+        primary = Orbit(a=1.0, e=0.6, m=1.0, G=1.2)
+        secondary = Orbit(a=1.6, e=0.3, m=0.7, G=1.2)
+        pair = OrbitPair(primary, secondary, cos_inclination=-0.4)
 
         inner, outer = pair.inner, pair.outer
         a = min(inner.periapsis, outer.periapsis)
