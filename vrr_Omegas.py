@@ -13,11 +13,16 @@ efficiently.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import scipy.special as sp
 from scipy.integrate import quad
+import math
+
+
+OmegaValue = Union[float, np.ndarray]
+TorqueValue = Union[float, np.ndarray]
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +37,11 @@ class Orbit:
     a: float
     e: float
     m: float
+    G: float = 1.0
+    M_central: float = 1.0
+    Lx: Optional[float] = None
+    Ly: Optional[float] = None
+    Lz: Optional[float] = None
 
     def __post_init__(self) -> None:
         """Validate the provided orbital elements."""
@@ -42,6 +52,17 @@ class Orbit:
             raise ValueError("The eccentricity must lie within [0, 1).")
         if self.m <= 0:
             raise ValueError("The mass must be positive.")
+        if self.G <= 0:
+            raise ValueError("The gravitational constant must be positive.")
+        if self.M_central <= 0:
+            raise ValueError("The central mass must be positive.")
+
+        components = (self.Lx, self.Ly, self.Lz)
+        has_components = [component is not None for component in components]
+        if any(has_components) and not all(has_components):
+            raise ValueError(
+                "All angular momentum vector components must be provided together."
+            )
 
     @property
     def b(self) -> float:
@@ -69,6 +90,26 @@ class Orbit:
         b = max(self.b, 1.0e-300)
         return self.a / b
 
+    @property
+    def angular_momentum_vector(self) -> Optional[np.ndarray]:
+        """Return the supplied angular-momentum vector, if available."""
+
+        if self.Lx is None and self.Ly is None and self.Lz is None:
+            return None
+        return np.array([float(self.Lx), float(self.Ly), float(self.Lz)], dtype=float)
+
+    @property
+    def angular_momentum_magnitude(self) -> float:
+        """Return ``|\vec{L}|`` either from the vector or Keplerian elements."""
+
+        vector = self.angular_momentum_vector
+        if vector is not None:
+            return float(np.linalg.norm(vector))
+
+        return self.m * np.sqrt(
+            self.G * self.M_central * self.a * max(1.0 - self.e ** 2, 0.0)
+        )
+
 
 @dataclass
 class OrbitPair:
@@ -77,17 +118,22 @@ class OrbitPair:
     primary: Orbit
     secondary: Orbit
     cos_inclination: float
-    G: float = 1.0
-    M_central: float = 1.0
 
     def __post_init__(self) -> None:
         """Validate inputs and initialise lazy caches."""
 
         self.cos_inclination = float(np.clip(self.cos_inclination, -1.0, 1.0))
-        if self.G <= 0:
-            raise ValueError("The gravitational constant must be positive.")
-        if self.M_central <= 0:
-            raise ValueError("The central mass must be positive.")
+
+        primary_constants = (self.primary.G, self.primary.M_central)
+        secondary_constants = (self.secondary.G, self.secondary.M_central)
+
+        if not math.isclose(primary_constants[0], secondary_constants[0], rel_tol=1.0e-12, abs_tol=0.0):
+            raise ValueError("Both orbits must use the same gravitational constant.")
+        if not math.isclose(primary_constants[1], secondary_constants[1], rel_tol=1.0e-12, abs_tol=0.0):
+            raise ValueError("Both orbits must use the same central mass.")
+
+        self._G = float(primary_constants[0])
+        self._M_central = float(primary_constants[1])
 
         self._update_orbit_ordering()
 
@@ -189,6 +235,18 @@ class OrbitPair:
         return self._outer
 
     @property
+    def G(self) -> float:
+        """Return the gravitational constant shared by the orbits."""
+
+        return self._G
+
+    @property
+    def M_central(self) -> float:
+        """Return the central mass shared by the orbits."""
+
+        return self._M_central
+
+    @property
     def primary_is_inner(self) -> bool:
         """Indicate whether the primary orbit is the inner orbit."""
 
@@ -257,10 +315,51 @@ class OrbitPair:
         self._ensure_dynamics_signature()
         return -self.angular_momentum_primary * self.sin_inclination
 
-    def torque_from_omega(self, omega: float) -> float:
+    def has_angular_momentum_vectors(self) -> bool:
+        """Return ``True`` when both orbits supply ``\vec{L}`` components."""
+
+        return (
+            self.primary.angular_momentum_vector is not None
+            and self.secondary.angular_momentum_vector is not None
+        )
+
+    def _omega_vector_from_scalar(self, omega: float) -> np.ndarray:
+        """Return the precession vector corresponding to ``omega``."""
+
+        secondary_vector = self.secondary.angular_momentum_vector
+        if secondary_vector is None:
+            return np.zeros(3, dtype=float)
+
+        magnitude = float(np.linalg.norm(secondary_vector))
+        if magnitude <= 0.0:
+            return np.zeros(3, dtype=float)
+
+        return float(omega) * secondary_vector / magnitude
+
+    def omega_from_scalar(self, omega: float) -> OmegaValue:
+        """Return the appropriate representation of the precession rate."""
+
+        if self.has_angular_momentum_vectors():
+            return self._omega_vector_from_scalar(float(omega))
+        return float(omega)
+
+    def torque_from_omega(self, omega: OmegaValue) -> TorqueValue:
         """Return the torque corresponding to the supplied ``Omega``."""
 
-        return self.torque_prefactor() * float(omega)
+        if self.has_angular_momentum_vectors():
+            primary_vector = self.primary.angular_momentum_vector
+            if primary_vector is None:
+                return np.zeros(3, dtype=float)
+
+            if isinstance(omega, np.ndarray):
+                omega_vector = np.asarray(omega, dtype=float)
+            else:
+                omega_vector = self._omega_vector_from_scalar(float(omega))
+
+            return np.cross(omega_vector, primary_vector)
+
+        omega_scalar = float(np.asarray(omega, dtype=float))
+        return self.torque_prefactor() * omega_scalar
 
     def get_couplings(
         self,
@@ -337,10 +436,7 @@ class OrbitPair:
     def angular_momentum_primary(self) -> float:
         """Return the magnitude of the primary orbit's angular momentum."""
 
-        orb = self.primary
-        return orb.m * np.sqrt(
-            self.G * self.M_central * orb.a * max(1.0 - orb.e ** 2, 0.0)
-        )
+        return self.primary.angular_momentum_magnitude
 
     @property
     def orbital_frequency_primary(self) -> float:
@@ -370,11 +466,9 @@ def _build_pair(
     """Instantiate an :class:`OrbitPair` for convenience wrappers."""
 
     return OrbitPair(
-        Orbit(a_i, e_i, m_i),
-        Orbit(a_j, e_j, m_j),
+        Orbit(a_i, e_i, m_i, G=G, M_central=M_central),
+        Orbit(a_j, e_j, m_j, G=G, M_central=M_central),
         cos_inc,
-        G=G,
-        M_central=M_central,
     )
 
 
@@ -767,7 +861,7 @@ class LegendreSeriesData:
     physical_coefficients: np.ndarray
     hamiltonian: float
     omega: float
-    torque: float
+    torque: TorqueValue
     hamiltonian_terms: Optional[np.ndarray] = None
     hamiltonian_partial_sums: Optional[np.ndarray] = None
     omega_terms: Optional[np.ndarray] = None
@@ -816,8 +910,8 @@ def _evaluate_legendre_series(
     omega_geom = float(np.sum(omega_terms_geom))
 
     hamiltonian = mass * hamiltonian_geom
-    omega = mass * omega_geom
-    torque = pair.torque_from_omega(omega)
+    omega_scalar = mass * omega_geom
+    torque = pair.torque_from_omega(omega_scalar)
 
     h_terms = mass * h_terms_geom if include_terms else None
     omega_terms = mass * omega_terms_geom if include_terms else None
@@ -830,7 +924,7 @@ def _evaluate_legendre_series(
         geom_arr,
         physical,
         hamiltonian,
-        omega,
+        omega_scalar,
         torque,
         h_terms,
         h_partial,
@@ -879,6 +973,55 @@ def Sprime_circ_log_kernel(x: float, alpha: float) -> float:
     return value + term1 - term2
 
 
+def _integrate_sprime(
+    func: Callable[[float], float],
+    x: float,
+    *,
+    epsabs: float,
+    epsrel: float,
+) -> float:
+    """Return the integral of ``func`` from alignment to ``x``."""
+
+    x_clipped = float(np.clip(x, -1.0, 1.0))
+    if abs(x_clipped - 1.0) < 1.0e-12:
+        return 0.0
+
+    def integrand(u: float) -> float:
+        return float(func(float(u)))
+
+    val, _ = quad(
+        integrand,
+        1.0,
+        x_clipped,
+        epsabs=epsabs,
+        epsrel=epsrel,
+        limit=200,
+    )
+    return -float(val)
+
+
+def S_circ_log_kernel(x: float, alpha: float, *, epsabs: float, epsrel: float) -> float:
+    """Return the circular--circular Hamiltonian kernel ``S(x; alpha)``."""
+
+    return _integrate_sprime(
+        lambda u: Sprime_circ_log_kernel(u, alpha),
+        x,
+        epsabs=epsabs,
+        epsrel=epsrel,
+    )
+
+
+def S_ecc_kernel(x: float, z: float, *, epsabs: float, epsrel: float) -> float:
+    """Return the eccentric--eccentric Hamiltonian kernel ``S(x; z)``."""
+
+    return _integrate_sprime(
+        lambda u: Sprime_ecc_kernel(u, z),
+        x,
+        epsabs=epsabs,
+        epsrel=epsrel,
+    )
+
+
 def S2_even_integral_kernel(x: float, z: float) -> float:
     """Return the ``S_2`` kernel for one-circular mixed configurations."""
 
@@ -892,6 +1035,24 @@ def S2_even_integral_kernel(x: float, z: float) -> float:
 
     val, _ = quad(integrand, 0.0, 1.0, epsabs=1.0e-10, epsrel=1.0e-10, limit=200)
     return float(val / np.sqrt(np.pi))
+
+
+def S2_even_kernel(x: float, z: float, *, epsabs: float, epsrel: float) -> float:
+    """Return the mixed one-circular Hamiltonian kernel ``S_2(x; z)``."""
+
+    return _integrate_sprime(
+        lambda u: S2_even_integral_kernel(u, z),
+        x,
+        epsabs=epsabs,
+        epsrel=epsrel,
+    )
+
+
+def S_overlap_kernel(x: float) -> float:
+    """Return the overlapping-orbit Hamiltonian kernel ``S(x)``."""
+
+    x_clipped = float(np.clip(x, -1.0, 1.0))
+    return -np.sqrt(max(1.0 - x_clipped * x_clipped, 0.0))
 
 
 def I2_numeric(a: float, b: float, c: float, d: float) -> float:
@@ -1138,31 +1299,81 @@ def _omega_kernel_overlap(
     return factor * (np.cos(theta) / sin_theta)
 
 
-def _integrate_kernel(
+def _hamiltonian_kernel_both_circular(
     pair: OrbitPair,
-    omega_kernel: Callable[[OrbitPair, float, Optional[str]], float],
+    x: float,
     tag: Optional[str],
     quad_epsabs: float,
     quad_epsrel: float,
 ) -> float:
-    """Integrate the analytic ``Ω`` kernel to recover the Hamiltonian."""
+    """Return the Hamiltonian kernel for two circular orbits."""
 
-    x = float(pair.cos_inclination)
-    if abs(x - 1.0) < 1.0e-12:
-        return 0.0
-
-    def integrand(u: float) -> float:
-        return -pair.angular_momentum_primary * omega_kernel(pair, float(u), tag)
-
-    val, _ = quad(
-        integrand,
-        1.0,
-        x,
-        epsabs=quad_epsabs,
-        epsrel=quad_epsrel,
-        limit=200,
+    alpha = max(pair.inner.a / max(pair.outer.a, 1.0e-300), 0.0)
+    radius_ratio = pair.primary.a / max(pair.outer.a, 1.0e-300)
+    omega_orb = pair.orbital_frequency_primary
+    prefactor = (
+        2.0
+        * np.pi
+        * omega_orb
+        * (pair.secondary.m / pair.M_central)
+        * radius_ratio
     )
-    return float(val)
+    S_val = S_circ_log_kernel(float(x), alpha, epsabs=quad_epsabs, epsrel=quad_epsrel)
+    return -pair.angular_momentum_primary * prefactor * S_val
+
+
+def _hamiltonian_kernel_one_circular_non_overlap(
+    pair: OrbitPair,
+    x: float,
+    tag: Optional[str],
+    quad_epsabs: float,
+    quad_epsrel: float,
+) -> float:
+    """Return the Hamiltonian kernel for mixed non-overlapping configurations."""
+
+    if tag not in {"inner", "outer"}:
+        raise ValueError("Circular configuration tag required for mixed regime.")
+
+    z = float(pair.z_parameter)
+    ecc_orbit = pair.outer if tag == "inner" else pair.inner
+    a_out = max(pair.outer.a, 1.0e-300)
+    prefactor = (
+        (1.0 / a_out)
+        * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
+        * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
+    )
+    S_geom = S2_even_kernel(float(x), z, epsabs=quad_epsabs, epsrel=quad_epsrel)
+    return pair.mass_prefactor() * prefactor * S_geom
+
+
+def _hamiltonian_kernel_non_overlap(
+    pair: OrbitPair,
+    x: float,
+    tag: Optional[str],
+    quad_epsabs: float,
+    quad_epsrel: float,
+) -> float:
+    """Return the Hamiltonian kernel for eccentric non-overlapping orbits."""
+
+    z = float(pair.z_parameter)
+    J_bar_geom = Jbar_ecc_nonoverlap(pair)
+    S_geom = S_ecc_kernel(float(x), z, epsabs=quad_epsabs, epsrel=quad_epsrel)
+    return pair.mass_prefactor() * J_bar_geom * S_geom
+
+
+def _hamiltonian_kernel_overlap(
+    pair: OrbitPair,
+    x: float,
+    tag: Optional[str],
+    quad_epsabs: float,
+    quad_epsrel: float,
+) -> float:
+    """Return the Hamiltonian kernel for overlapping or embedded orbits."""
+
+    del quad_epsabs, quad_epsrel  # Unused: kernel is analytic
+    J_bar_geom = Jbar_ecc_overlap(pair)
+    S_geom = S_overlap_kernel(float(x))
+    return 0.5 * pair.mass_prefactor() * J_bar_geom * S_geom
 
 
 @dataclass(frozen=True)
@@ -1171,6 +1382,7 @@ class AsymptoticRegimeEntry:
 
     ell_factory: Callable[[int], np.ndarray]
     j_function: Callable[[OrbitPair, Sequence[int], Optional[str]], np.ndarray]
+    hamiltonian_kernel: Callable[[OrbitPair, float, Optional[str], float, float], float]
     omega_kernel: Callable[[OrbitPair, float, Optional[str]], float]
 
     def ell_grid(self, ell_max: int) -> np.ndarray:
@@ -1189,7 +1401,15 @@ class AsymptoticRegimeEntry:
         tag: Optional[str],
     ) -> tuple[float, float]:
         omega_val = float(self.omega_kernel(pair, pair.cos_inclination, tag))
-        h_val = _integrate_kernel(pair, self.omega_kernel, tag, quad_epsabs, quad_epsrel)
+        h_val = float(
+            self.hamiltonian_kernel(
+                pair,
+                pair.cos_inclination,
+                tag,
+                quad_epsabs,
+                quad_epsrel,
+            )
+        )
         return h_val, omega_val
 
 
@@ -1197,21 +1417,25 @@ ASYMPTOTIC_REGISTRY: Dict[str, AsymptoticRegimeEntry] = {
     "both_circular": AsymptoticRegimeEntry(
         _asymptotic_ell_grid_default,
         _J_asymptotic_both_circular,
+        _hamiltonian_kernel_both_circular,
         _omega_kernel_both_circular,
     ),
     "one_circular_non_overlap": AsymptoticRegimeEntry(
         _asymptotic_ell_grid_default,
         _J_asymptotic_one_circular_non_overlap,
+        _hamiltonian_kernel_one_circular_non_overlap,
         _omega_kernel_one_circular_non_overlap,
     ),
     "eccentric_non_overlap": AsymptoticRegimeEntry(
         _asymptotic_ell_grid_default,
         _J_asymptotic_non_overlap,
+        _hamiltonian_kernel_non_overlap,
         _omega_kernel_non_overlap,
     ),
     "overlap": AsymptoticRegimeEntry(
         _asymptotic_ell_grid_default,
         _J_asymptotic_overlap,
+        _hamiltonian_kernel_overlap,
         _omega_kernel_overlap,
     ),
 }
@@ -1596,8 +1820,8 @@ class InteractionResult:
     """Container bundling the interaction Hamiltonian, frequency and torque."""
 
     hamiltonian: float
-    omega: float
-    torque: float
+    omega: OmegaValue
+    torque: TorqueValue
     series_ell: Optional[np.ndarray] = None
     series_coefficients: Optional[np.ndarray] = None
     hamiltonian_terms: Optional[np.ndarray] = None
@@ -1643,11 +1867,9 @@ class BaseEvaluator:
 
         pairs = [
             OrbitPair(
-                Orbit(a_p, e_p, m_p),
-                Orbit(a_s, e_s, m_s),
+                Orbit(a_p, e_p, m_p, G=G, M_central=M_central),
+                Orbit(a_s, e_s, m_s, G=G, M_central=M_central),
                 cos_inc,
-                G=G,
-                M_central=M_central,
             )
             for a_p, e_p, m_p, a_s, e_s, m_s, cos_inc in zip(
                 a_primary,
@@ -1700,8 +1922,8 @@ class ExactSeriesEvaluator(BaseEvaluator):
         }.issubset(cached):
             return InteractionResult(
                 hamiltonian=float(cached["hamiltonian"]),
-                omega=float(cached["omega"]),
-                torque=float(cached["torque"]),
+                omega=cached["omega"],
+                torque=cached["torque"],
                 series_ell=cached.get("series_ell"),
                 series_coefficients=cached.get("series_coefficients"),
                 hamiltonian_terms=cached.get("hamiltonian_terms"),
@@ -1713,7 +1935,14 @@ class ExactSeriesEvaluator(BaseEvaluator):
 
         series_ell = even_ells(self.ell_max, start=0)
         if series_ell.size == 0:
-            return InteractionResult(0.0, 0.0, 0.0, method=self.method_name)
+            omega_zero = pair.omega_from_scalar(0.0)
+            torque_zero = pair.torque_from_omega(0.0)
+            return InteractionResult(
+                0.0,
+                omega_zero,
+                torque_zero,
+                method=self.method_name,
+            )
 
         geom_vals = pair.get_couplings(
             "exact:J_exact",
@@ -1731,10 +1960,11 @@ class ExactSeriesEvaluator(BaseEvaluator):
             include_terms=True,
             include_partials=True,
         )
+        omega_value = pair.omega_from_scalar(series_data.omega)
 
         result = InteractionResult(
             hamiltonian=series_data.hamiltonian,
-            omega=series_data.omega,
+            omega=omega_value,
             torque=series_data.torque,
             series_ell=series_data.ells,
             series_coefficients=series_data.physical_coefficients,
@@ -1748,7 +1978,7 @@ class ExactSeriesEvaluator(BaseEvaluator):
         pair.cache_dynamics(
             self.method_name,
             hamiltonian=series_data.hamiltonian,
-            omega=series_data.omega,
+            omega=omega_value,
             torque=series_data.torque,
             series_ell=series_data.ells,
             series_coefficients=series_data.physical_coefficients,
@@ -1797,8 +2027,8 @@ class AsymptoticEvaluator(BaseEvaluator):
         }.issubset(cached):
             return InteractionResult(
                 hamiltonian=float(cached["hamiltonian"]),
-                omega=float(cached["omega"]),
-                torque=float(cached["torque"]),
+                omega=cached["omega"],
+                torque=cached["torque"],
                 series_ell=cached.get("series_ell"),
                 series_coefficients=cached.get("series_coefficients"),
                 method=self.method_name,
@@ -1812,9 +2042,11 @@ class AsymptoticEvaluator(BaseEvaluator):
         )
         series_data = _evaluate_legendre_series(pair, components.ells, components.geometry)
 
+        omega_value = pair.omega_from_scalar(series_data.omega)
+
         result = InteractionResult(
             hamiltonian=series_data.hamiltonian,
-            omega=series_data.omega,
+            omega=omega_value,
             torque=series_data.torque,
             series_ell=series_data.ells,
             series_coefficients=series_data.physical_coefficients,
@@ -1824,7 +2056,7 @@ class AsymptoticEvaluator(BaseEvaluator):
         pair.cache_dynamics(
             self.method_name,
             hamiltonian=series_data.hamiltonian,
-            omega=series_data.omega,
+            omega=omega_value,
             torque=series_data.torque,
             series_ell=series_data.ells,
             series_coefficients=series_data.physical_coefficients,
@@ -1864,8 +2096,8 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
         }.issubset(cached):
             return InteractionResult(
                 hamiltonian=float(cached["hamiltonian"]),
-                omega=float(cached["omega"]),
-                torque=float(cached["torque"]),
+                omega=cached["omega"],
+                torque=cached["torque"],
                 series_ell=cached.get("series_ell"),
                 series_coefficients=cached.get("series_coefficients"),
                 method=self.method_name,
@@ -1880,12 +2112,13 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
 
         ells = even_ells(self.lmax_correction)
         if ells.size == 0:
-            omega = components.omega_kernel
-            torque = pair.torque_from_omega(omega)
+            omega_scalar = components.omega_kernel
+            omega_value = pair.omega_from_scalar(omega_scalar)
+            torque = pair.torque_from_omega(omega_scalar)
             empty = np.zeros(0, dtype=float)
             result = InteractionResult(
                 hamiltonian=components.h_kernel,
-                omega=omega,
+                omega=omega_value,
                 torque=torque,
                 series_ell=ells,
                 series_coefficients=empty,
@@ -1894,7 +2127,7 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             pair.cache_dynamics(
                 self.method_name,
                 hamiltonian=components.h_kernel,
-                omega=omega,
+                omega=omega_value,
                 torque=torque,
                 series_ell=ells,
                 series_coefficients=empty,
@@ -1918,19 +2151,20 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             + exact_series.hamiltonian
             - asymp_series.hamiltonian
         )
-        omega = (
+        omega_scalar = (
             components.omega_kernel
             + exact_series.omega
             - asymp_series.omega
         )
-        torque = pair.torque_from_omega(omega)
+        omega_value = pair.omega_from_scalar(omega_scalar)
+        torque = pair.torque_from_omega(omega_scalar)
 
         mass = pair.mass_prefactor()
         series_coefficients = mass * (geom_exact - geom_asym)
 
         result = InteractionResult(
             hamiltonian=hamiltonian,
-            omega=omega,
+            omega=omega_value,
             torque=torque,
             series_ell=ells,
             series_coefficients=series_coefficients,
@@ -1940,7 +2174,7 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
         pair.cache_dynamics(
             self.method_name,
             hamiltonian=hamiltonian,
-            omega=omega,
+            omega=omega_value,
             torque=torque,
             series_ell=ells,
             series_coefficients=series_coefficients,
