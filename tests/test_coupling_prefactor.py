@@ -11,14 +11,9 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     np = None  # type: ignore[assignment]
 
 if np is not None:  # pragma: no branch - guard import for optional dependency
-    from vrr_Omegas import (
-        I2_numeric,
-        J_exact,
-        Jbar_ecc_nonoverlap,
-        Jbar_ecc_overlap,
-        Orbit,
-        OrbitPair,
-    )
+    from vrr.geometry import J_exact
+    from vrr.kernels import I2_numeric, Jbar_ecc_nonoverlap, Jbar_ecc_overlap
+    from vrr.orbits import Orbit, OrbitPair
 else:  # pragma: no cover - keep type checkers satisfied when NumPy missing
     I2_numeric = J_exact = Jbar_ecc_nonoverlap = Jbar_ecc_overlap = None  # type: ignore[assignment]
     Orbit = OrbitPair = None  # type: ignore[assignment]
