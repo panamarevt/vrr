@@ -63,6 +63,25 @@ def overlapping_pairs() -> List[OrbitPair]:
     return pairs
 
 
+def _summarize_value(name: str, val) -> str:
+    try:
+        import numpy as _np
+        if isinstance(val, (list, tuple)):
+            arr = _np.asarray(val, dtype=float)
+        else:
+            arr = _np.asarray(val)
+        if arr.shape == ():
+            return f"{name}={float(arr):.6g}"
+        # vector-like: show magnitude and first 3 comps
+        flat = arr.reshape(-1)
+        mag = float(_np.linalg.norm(flat))
+        head = ", ".join(f"{float(x):.6g}" for x in flat[:3])
+        more = ", …" if flat.size > 3 else ""
+        return f"{name}|mag={mag:.6g}|vec=({head}{more})"
+    except Exception:
+        return f"{name}={val}"
+
+
 def bench_pair(idx: int, pair: OrbitPair, nodes: int) -> None:
     """Benchmark a single pair using a shared Gauss-Legendre node count.
 
@@ -78,9 +97,8 @@ def bench_pair(idx: int, pair: OrbitPair, nodes: int) -> None:
         correction_overlap_nodes=nodes,
     )
 
-    logger.info(
-        f"\nCase #{idx}: a=({pair.primary.a:.3g},{pair.secondary.a:.3g}) e=({pair.primary.e:.3g},{pair.secondary.e:.3g}) \n"
-    )
+    sep = "#" * 70
+    logger.info(f"\n{sep}\nCase #{idx}: a=({pair.primary.a:.3g},{pair.secondary.a:.3g}) e=({pair.primary.e:.3g},{pair.secondary.e:.3g})\n{sep}")
 
     t0 = perf_counter()
     r_exact = exact.evaluate_pair(pair)
@@ -104,8 +122,18 @@ def bench_pair(idx: int, pair: OrbitPair, nodes: int) -> None:
     )
 
     speedup = t_exact / max(t_hyb, 1e-12)
+    H_ex = _summarize_value("H_ex", r_exact.hamiltonian)
+    Om_ex = _summarize_value("Omega_ex", r_exact.omega)
+    T_ex = _summarize_value("tau_ex", r_exact.torque)
+    H_hy = _summarize_value("H_hyb", r_hyb.hamiltonian)
+    Om_hy = _summarize_value("Omega_hyb", r_hyb.omega)
+    T_hy = _summarize_value("tau_hyb", r_hyb.torque)
+
     logger.info(
-        f"exact: {t_exact:8.2f} ms | hybrid: {t_hyb:8.2f} ms | speedup x{speedup:5.2f} | finite={ok}"
+        (
+            f"exact: {t_exact:8.2f} ms | {H_ex} | {Om_ex} | {T_ex}  ||  "
+            f"hybrid: {t_hyb:8.2f} ms | {H_hy} | {Om_hy} | {T_hy} | speedup x{speedup:5.2f} | finite={ok}"
+        )
     )
 
 
