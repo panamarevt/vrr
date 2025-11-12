@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Callable, List, Optional, Sequence
 
 import numpy as np
@@ -35,6 +36,20 @@ from .orbits import (
     _order_by_apocenter,
     _regime_flags,
 )
+
+# Prefer loguru's logger; fall back gracefully to stdlib logging
+try:  # pragma: no cover - trivial import guard
+    from loguru import logger  # type: ignore
+except Exception:  # pragma: no cover - fallback path
+    import logging as _logging
+
+    logger = _logging.getLogger("vrr.evaluators")
+    if not logger.handlers:
+        _handler = _logging.StreamHandler()
+        _formatter = _logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+        _handler.setFormatter(_formatter)
+        logger.addHandler(_handler)
+    logger.setLevel(_logging.DEBUG)
 
 
 @dataclass
@@ -209,65 +224,120 @@ def _J_asymptotic_both_circular(
     pair: OrbitPair, ells: Sequence[int], tag: Optional[str] = None
 ) -> np.ndarray:
     """Return asymptotic ``J_{ijℓ}`` values for two circular orbits."""
+    from time import perf_counter
 
     ell_arr = np.asarray(ells, dtype=int)
-    return np.zeros_like(ell_arr, dtype=float)
+    t0 = perf_counter()
+    out = np.zeros_like(ell_arr, dtype=float)
+    dt = perf_counter() - t0
+    if ell_arr.size:
+        head = ", ".join(map(str, ell_arr.reshape(-1)[:5]))
+    else:
+        head = ""
+    logger.debug(
+        (
+            f"J_asymptotic_both_circular: ℓ size={ell_arr.size} head=[{head}{'' if ell_arr.size<=5 else ', …'}] | "
+            f"out.shape={out.shape} | {dt*1e3:.2f} ms"
+        )
+    )
+    return out
 
 
 def _J_asymptotic_one_circular_non_overlap(
     pair: OrbitPair, ells: Sequence[int], tag: Optional[str]
 ) -> np.ndarray:
     """Return asymptotic ``J_{ijℓ}`` for mixed (one circular) non-overlap pairs."""
+    from time import perf_counter
 
     if tag not in {"inner", "outer"}:
         raise ValueError("Circular configuration tag required for mixed regime.")
 
     ell_arr = np.asarray(ells, dtype=int)
+    t0 = perf_counter()
     if ell_arr.size == 0:
-        return np.zeros_like(ell_arr, dtype=float)
-
-    safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
-    z = float(pair.z_parameter)
-    ecc_orbit = pair.outer if tag == "inner" else pair.inner
-    a_out = max(pair.outer.a, 1.0e-300)
-    prefactor = (
-        (1.0 / a_out)
-        * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
-        * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
+        out = np.zeros_like(ell_arr, dtype=float)
+    else:
+        safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
+        z = float(pair.z_parameter)
+        ecc_orbit = pair.outer if tag == "inner" else pair.inner
+        a_out = max(pair.outer.a, 1.0e-300)
+        prefactor = (
+            (1.0 / a_out)
+            * (2.0 / (np.pi * np.sqrt(2.0 * np.pi)))
+            * np.sqrt(max(1.0 - ecc_orbit.e, 0.0) / max(ecc_orbit.e, 1.0e-300))
+        )
+        powers = np.asarray(z ** ell_arr, dtype=float)
+        out = (prefactor * powers / (safe_ell ** 1.5)).astype(float, copy=False)
+    dt = perf_counter() - t0
+    if ell_arr.size:
+        head = ", ".join(map(str, ell_arr.reshape(-1)[:5]))
+    else:
+        head = ""
+    logger.debug(
+        (
+            f"J_asymptotic_one_circ_non_overlap: tag={tag} | z={float(pair.z_parameter):.6g} | "
+            f"ℓ size={ell_arr.size} head=[{head}{'' if ell_arr.size<=5 else ', …'}] | out.shape={out.shape} | {dt*1e3:.2f} ms"
+        )
     )
-    powers = np.asarray(z ** ell_arr, dtype=float)
-    result = prefactor * powers / (safe_ell ** 1.5)
-    return result.astype(float, copy=False)
+    return out
 
 
 def _J_asymptotic_non_overlap(
     pair: OrbitPair, ells: Sequence[int], tag: Optional[str] = None
 ) -> np.ndarray:
     """Return asymptotic ``J_{ijℓ}`` for eccentric non-overlapping orbits."""
+    from time import perf_counter
 
     ell_arr = np.asarray(ells, dtype=int)
+    t0 = perf_counter()
     if ell_arr.size == 0:
-        return np.zeros_like(ell_arr, dtype=float)
-
-    safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
-    J_bar = Jbar_ecc_nonoverlap(pair)
-    result = J_bar / (safe_ell ** 2)
-    return np.asarray(result, dtype=float)
+        out = np.zeros_like(ell_arr, dtype=float)
+        J_bar = Jbar_ecc_nonoverlap(pair)
+    else:
+        safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
+        J_bar = Jbar_ecc_nonoverlap(pair)
+        out = np.asarray(J_bar / (safe_ell ** 2), dtype=float)
+    dt = perf_counter() - t0
+    if ell_arr.size:
+        head = ", ".join(map(str, ell_arr.reshape(-1)[:5]))
+    else:
+        head = ""
+    logger.debug(
+        (
+            f"J_asymptotic_non_overlap: Jbar={float(J_bar):.6g} | ℓ size={ell_arr.size} head=[{head}{'' if ell_arr.size<=5 else ', …'}] "
+            f"| out.shape={out.shape} | {dt*1e3:.2f} ms"
+        )
+    )
+    return out
 
 
 def _J_asymptotic_overlap(
     pair: OrbitPair, ells: Sequence[int], tag: Optional[str] = None
 ) -> np.ndarray:
     """Return asymptotic ``J_{ijℓ}`` for overlapping or embedded orbits."""
+    from time import perf_counter
 
     ell_arr = np.asarray(ells, dtype=int)
+    t0 = perf_counter()
     if ell_arr.size == 0:
-        return np.zeros_like(ell_arr, dtype=float)
-
-    safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
-    J_bar = Jbar_ecc_overlap(pair)
-    result = J_bar / (safe_ell ** 2)
-    return np.asarray(result, dtype=float)
+        out = np.zeros_like(ell_arr, dtype=float)
+        J_bar = Jbar_ecc_overlap(pair)
+    else:
+        safe_ell = np.where(ell_arr == 0, np.inf, ell_arr.astype(float))
+        J_bar = Jbar_ecc_overlap(pair)
+        out = np.asarray(J_bar / (safe_ell ** 2), dtype=float)
+    dt = perf_counter() - t0
+    if ell_arr.size:
+        head = ", ".join(map(str, ell_arr.reshape(-1)[:5]))
+    else:
+        head = ""
+    logger.debug(
+        (
+            f"J_asymptotic_overlap: Jbar={float(J_bar):.6g} | ℓ size={ell_arr.size} head=[{head}{'' if ell_arr.size<=5 else ', …'}] "
+            f"| out.shape={out.shape} | {dt*1e3:.2f} ms"
+        )
+    )
+    return out
 
 
 @dataclass(frozen=True)
@@ -437,6 +507,13 @@ class AsymptoticEvaluator(BaseEvaluator):
             self.quad_epsabs,
             self.quad_epsrel,
         )
+        logger.debug(
+            (
+                f"asymptotic: regime={components.regime} tag={str(components.tag)} | "
+                f"ell_max={int(self.ell_max)} | h_kernel={float(components.h_kernel):.6g} | "
+                f"omega_kernel={float(components.omega_kernel):.6g}"
+            )
+        )
         series_data = _evaluate_legendre_series(pair, components.ells, components.geometry)
 
         omega_value = pair.omega_from_scalar(series_data.omega)
@@ -465,17 +542,53 @@ class AsymptoticEvaluator(BaseEvaluator):
 
 
 class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
-    """Augment the asymptotic result with low-order exact corrections."""
+    """Augment the asymptotic result with low-order exact corrections.
+
+    The hybrid estimate = asymptotic kernels (large-ℓ tail) + exact low-order
+    Legendre contributions − asymptotic approximation to those same low-order
+    terms. This class now exposes extra knobs to tune the geometry-only
+    evaluation of the correction band to improve performance for overlapping
+    orbits where :func:`s_ijl` quadrature dominates runtime.
+
+    Parameters
+    ----------
+    ell_max : int
+        Maximum ℓ used for the asymptotic tail (inherited from parent).
+    lmax_correction : int, default 4
+        Highest ℓ included in the low-order exact correction band (ℓ ≥ 2).
+    correction_s_method : {"auto", "exact", "closed_form"}, default "auto"
+        Mode passed to :func:`J_exact` / :func:`s_ijl` for the correction band.
+        Use "closed_form" to force the non-overlap expression when regimes
+        are guaranteed non-overlapping. Use "exact" to force quadrature.
+    correction_overlap_nodes : int, default 120
+        Gauss-Legendre node count for overlapping quadrature inside the
+        correction band (smaller than the default 200 to reduce cost).
+    correction_ecc_tol : float, default 1e-3
+        Eccentricity threshold forwarded to :func:`s_ijl`.
+    **kwargs
+        Forwarded to :class:`AsymptoticEvaluator` (ell_max, quad tolerances).
+    """
 
     method_name = "asymptotic_with_corrections"
 
-    def __init__(self, lmax_correction: int = 4, **kwargs: Any) -> None:
-        """Initialise the hybrid evaluator and select correction order."""
-
+    def __init__(
+        self,
+        lmax_correction: int = 4,
+        *,
+        correction_s_method: str = "auto",
+        correction_overlap_nodes: int = 120,
+        correction_ecc_tol: float = 1.0e-3,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         if lmax_correction < 2:
             raise ValueError("The correction order must be at least 2.")
-        self.lmax_correction = lmax_correction
+        self.lmax_correction = int(lmax_correction)
+        # Enforce a single ℓ_max across asymptotic and correction band
+        self.ell_max = int(self.lmax_correction)
+        self.correction_s_method = str(correction_s_method)
+        self.correction_overlap_nodes = int(correction_overlap_nodes)
+        self.correction_ecc_tol = float(correction_ecc_tol)
 
     def evaluate_pair(self, pair: OrbitPair) -> InteractionResult:
         """Return the hybrid interaction result for ``pair``."""
@@ -495,14 +608,33 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
                 method=self.method_name,
             )
 
+        logger.debug(
+            (
+                f"hybrid: start | lmax_corr={int(self.lmax_correction)} | ell_max={int(self.ell_max)} | "
+                f"quad=({float(self.quad_epsabs):.1e}, {float(self.quad_epsrel):.1e}) | "
+                f"a=({float(pair.primary.a):.6g}, {float(pair.secondary.a):.6g}) | "
+                f"e=({float(pair.primary.e):.3g}, {float(pair.secondary.e):.3g}) | "
+                f"cos_inc={float(pair.cos_inclination):.4f}"
+            )
+        )
+        t0 = perf_counter()
         components = asymptotic_components(
             pair,
             self.ell_max,
             self.quad_epsabs,
             self.quad_epsrel,
         )
+        t_components = perf_counter() - t0
+        logger.debug(
+            (
+                f"hybrid: asymptotic components | regime={components.regime} tag={str(components.tag)} | "
+                f"n_ell={int(components.ells.size)} | h_kernel={float(components.h_kernel):.6g} | "
+                f"omega_kernel={float(components.omega_kernel):.6g}"
+            )
+        )
 
-        ells = legendre_series_ells(self.lmax_correction, start=2)
+        # Reuse the asymptotic ℓ-grid; avoids recomputing Jbar/I2 for a different set
+        ells = components.ells
         if ells.size == 0:
             omega_scalar = components.omega_kernel
             omega_value = pair.omega_from_scalar(omega_scalar)
@@ -526,17 +658,46 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             )
             return result
 
-        geom_exact = pair.get_couplings("exact:J_exact", ells, J_exact)
-        geom_asym = pair.get_couplings(
-            f"asymptotic:{components.regime}",
-            ells,
-            _compute_asymptotic_couplings,
-            regime=components.regime,
-            tag=components.tag,
+        logger.debug(
+            (
+                f"hybrid: corrections over ℓ size={int(ells.size)} min={str(int(ells.min())) if ells.size else '-'} "
+                f"max={str(int(ells.max())) if ells.size else '-'} | computing geom_exact (reuse asymptotic geom)"
+            )
         )
 
+        t1 = perf_counter()
+        # Use a lightweight wrapper so we can tune s_ijl parameters separately
+        # for the correction band without affecting other parts of the code.
+        def _exact_wrapper(p: OrbitPair, ell_arr: np.ndarray) -> np.ndarray:
+            return np.asarray(
+                J_exact(
+                    p,
+                    ell_arr,
+                    method=self.correction_s_method,
+                    nodes=self.correction_overlap_nodes,
+                    ecc_tol=self.correction_ecc_tol,
+                ),
+                dtype=float,
+            )
+
+        geom_exact = pair.get_couplings("exact:J_exact", ells, _exact_wrapper)
+        # Reuse asymptotic geometry computed above; avoid recomputation of Jbar/I2
+        geom_asym = np.asarray(components.geometry, dtype=float)
+        t_couplings = perf_counter() - t1
+
+        t2 = perf_counter()
         exact_series = _evaluate_legendre_series(pair, ells, geom_exact)
         asymp_series = _evaluate_legendre_series(pair, ells, geom_asym)
+        t_series = perf_counter() - t2
+
+        # Basic diagnostics on the corrections
+        try:
+            diff = np.asarray(geom_exact) - np.asarray(geom_asym)
+            d_abs = float(np.linalg.norm(diff, ord=1))
+            d_rel = float(d_abs / (np.linalg.norm(geom_exact, ord=1) + 1.0e-300))
+            logger.debug(f"hybrid: correction geom | L1_abs={d_abs:.3e} | L1_rel={d_rel:.3e}")
+        except Exception:
+            pass
 
         hamiltonian = (
             components.h_kernel
@@ -572,6 +733,35 @@ class AsymptoticWithCorrectionsEvaluator(AsymptoticEvaluator):
             series_coefficients=series_coefficients,
         )
 
+        # Build robust summaries for omega and torque (scalar or vector)
+        try:
+            if isinstance(omega_value, np.ndarray):
+                omega_summary = f"|Omega|={float(np.linalg.norm(omega_value)):.6g}"
+            else:
+                omega_summary = f"Omega={float(omega_value):.6g}"
+        except Exception:
+            omega_summary = f"Omega={omega_value}"
+
+        try:
+            if isinstance(result.torque, np.ndarray):
+                t = np.asarray(result.torque, dtype=float).reshape(-1)
+                if t.size >= 3:
+                    torque_summary = f"torque=({t[0]:.6g}, {t[1]:.6g}, {t[2]:.6g})"
+                else:
+                    torque_summary = f"torque={t.tolist()}"
+            else:
+                torque_summary = f"torque={float(result.torque):.6g}"
+        except Exception:
+            torque_summary = f"torque={result.torque}"
+
+        t_total = perf_counter() - t0
+        logger.debug(
+            (
+                f"hybrid: done | H={float(hamiltonian):.6g} | {omega_summary} | {torque_summary} | "
+                f"t_components={t_components*1e3:.2f} ms | t_couplings={t_couplings*1e3:.2f} ms | "
+                f"t_series={t_series*1e3:.2f} ms | t_total={t_total*1e3:.2f} ms"
+            )
+        )
         return result
 
 def _classify_circular(e_i: float, e_j: float, tol: float) -> str:

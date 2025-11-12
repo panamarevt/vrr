@@ -1,8 +1,18 @@
-"""Geometry-focused helpers for VRR couplings and Legendre series."""
+"""Geometry-focused helpers for VRR couplings and Legendre series.
+
+Logging
+-------
+This module emits debug-level logs using :mod:`loguru` when available.
+Key functions such as :func:`s_ijl`, :func:`J_exact`, and :func:`J_series`
+log the ℓ values used, chosen computational paths, and basic result
+summaries. A convenience wrapper :func:`timed_J_ijl` measures and logs
+the execution time of :func:`J_exact`.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Callable, Optional, Sequence
 
 import numpy as np
@@ -10,6 +20,20 @@ import scipy.special as sp
 
 from .legendre import even_ells, legendre_P, legendre_P_derivative, legendre_P_zero
 from .orbits import OrbitPair, TorqueValue
+
+# Prefer loguru's logger; fall back to stdlib logging if unavailable
+try:  # pragma: no cover - trivial import guard
+    from loguru import logger  # type: ignore
+except Exception:  # pragma: no cover - fallback path
+    import logging as _logging
+
+    logger = _logging.getLogger("vrr.geometry")
+    if not logger.handlers:
+        _handler = _logging.StreamHandler()
+        _formatter = _logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+        _handler.setFormatter(_formatter)
+        logger.addHandler(_handler)
+    logger.setLevel(_logging.DEBUG)
 
 
 def _to_output(value: np.ndarray | float) -> float | np.ndarray:
@@ -53,10 +77,16 @@ def _s_overlapping(
     ecc_tol: float = 1.0e-3,
 ) -> float | np.ndarray:
     """Evaluate ``s_{ijℓ}`` for overlapping annuli via Gauss-Legendre quadrature."""
-
+    t0_glob = perf_counter()
+    logger.debug(
+        f"s_ijl/overlap: start | nodes={int(nodes)} | ecc_tol={float(ecc_tol):.2e} | ell_size={np.size(ell)}"
+    )
     ell_arr = np.asarray(ell, dtype=int)
     if ell_arr.size == 0:
-        return np.asarray(ell_arr, dtype=float)
+        out = np.asarray(ell_arr, dtype=float)
+        dt = perf_counter() - t0_glob
+        logger.debug(f"s_ijl/overlap: done | empty ℓ | {dt*1e3:.2f} ms")
+        return out
 
     inner, outer = pair.inner, pair.outer
     alpha = inner.a / outer.a
@@ -97,7 +127,12 @@ def _s_overlapping(
     integrand = np.where(reg1_mask, reg1, reg2)
     total = np.tensordot(weights, integrand, axes=([0, 1], [0, 1]))
     result = (total / (np.pi ** 2)).reshape(ell_arr.shape)
-    return _to_output(result.astype(float, copy=False))
+    out = _to_output(result.astype(float, copy=False))
+    dt = perf_counter() - t0_glob
+    logger.debug(
+        f"s_ijl/overlap: done | nodes={int(nodes)} | ell_size={ell_arr.size} | out.shape={np.shape(out)} | {dt*1e3:.2f} ms"
+    )
+    return out
 
 
 def s_ijl(
@@ -108,8 +143,15 @@ def s_ijl(
     nodes: int = 200,
     ecc_tol: float = 1.0e-3,
 ) -> float | np.ndarray:
-    """Return the coefficient ``s_{ijℓ}`` for the supplied pair and indices."""
+    """Return the coefficient ``s_{ijℓ}`` for the supplied pair and indices.
 
+    Debug logging:
+    - Logs input ℓ values (size/min/max and first few entries) and ``method``.
+    - Logs which computational path was taken (closed form vs overlapping
+      quadrature vs auto path resolution) along with key parameters.
+    """
+
+    t0_total = perf_counter()
     ell_arr = np.asarray(ell, dtype=int)
     if ell_arr.size == 0:
         return np.asarray(ell_arr, dtype=float)
@@ -117,15 +159,29 @@ def s_ijl(
     ell_flat = ell_arr.reshape(-1)
     result_flat = np.ones_like(ell_flat, dtype=float)
 
+    # Summarise ℓ input for logs without spamming large arrays
+    def _ell_summary(vals: np.ndarray) -> str:
+        vals = vals.reshape(-1)
+        head = ", ".join(map(str, vals[:5]))
+        return f"size={vals.size}, min={vals.min()}, max={vals.max()}, head=[{head}{'' if vals.size<=5 else ', …'}]"
+
+    logger.debug(
+        f"s_ijl: start | {_ell_summary(ell_flat)} | non_overlap={bool(getattr(pair, 'non_overlapping', False))} "
+        f"| nodes={int(nodes)} | ecc_tol={float(ecc_tol):.2e} | method={str(method)}"
+    )
+
     if np.all(ell_flat == 0):
+        logger.debug("s_ijl: all ℓ are zero; returning ones")
         return _to_output(result_flat.reshape(ell_arr.shape))
 
     inner, outer = pair.inner, pair.outer
     if abs(inner.e) < ecc_tol and abs(outer.e) < ecc_tol:
+        logger.debug("s_ijl: both orbits ~circular (|e|<tol); returning ones")
         return _to_output(result_flat.reshape(ell_arr.shape))
 
     mask_nonzero = ell_flat != 0
     if not np.any(mask_nonzero):
+        logger.debug("s_ijl: no non-zero ℓ entries after mask; returning ones")
         return _to_output(result_flat.reshape(ell_arr.shape))
 
     mode = (method or "auto").lower()
@@ -136,10 +192,12 @@ def s_ijl(
         raise ValueError(f"Unknown s_ijl method '{method}'.")
 
     if mode == "closed_form":
+        logger.debug("s_ijl: using closed-form non-overlapping expression")
         if not pair.non_overlapping:
             raise ValueError("Closed-form s_ijl is only valid for non-overlapping orbits.")
         values = _s_non_overlapping(pair, ell_flat[mask_nonzero])
     elif mode == "exact":
+        logger.debug(f"s_ijl: using exact overlapping quadrature (nodes={int(nodes)})")
         values = _s_overlapping(
             pair,
             ell_flat[mask_nonzero],
@@ -148,8 +206,10 @@ def s_ijl(
         )
     else:
         if pair.non_overlapping:
+            logger.debug("s_ijl: auto mode resolved to non-overlapping closed form")
             values = _s_non_overlapping(pair, ell_flat[mask_nonzero])
         else:
+            logger.debug(f"s_ijl: auto mode resolved to overlapping quadrature (nodes={int(nodes)})")
             values = _s_overlapping(
                 pair,
                 ell_flat[mask_nonzero],
@@ -158,7 +218,10 @@ def s_ijl(
             )
 
     result_flat[mask_nonzero] = np.asarray(values, dtype=float)
-    return _to_output(result_flat.reshape(ell_arr.shape))
+    out = _to_output(result_flat.reshape(ell_arr.shape))
+    dt_total = perf_counter() - t0_total
+    logger.debug(f"s_ijl: done | output.shape={np.shape(out)} | {dt_total*1e3:.2f} ms")
+    return out
 
 
 def J_exact(
@@ -169,7 +232,12 @@ def J_exact(
     nodes: int = 200,
     ecc_tol: float = 1.0e-3,
 ) -> float | np.ndarray:
-    """Return the geometry-only coupling ``J_{ijℓ}`` for ``pair``."""
+    """Return the geometry-only coupling ``J_{ijℓ}`` for ``pair``.
+
+    Debug logging:
+    - Logs ℓ summary and the chosen ``s_ijl`` configuration.
+    - Logs basic geometry scale factors used in the closed form.
+    """
 
     ell_arr = np.asarray(ell, dtype=int)
     if ell_arr.size == 0:
@@ -183,8 +251,22 @@ def J_exact(
     a_inner = pair.inner.a
     a_outer = max(pair.outer.a, 1.0e-300)
 
+    def _ell_summary(vals: np.ndarray) -> str:
+        vals = np.asarray(vals).reshape(-1)
+        head = ", ".join(map(str, vals[:5]))
+        return f"size={vals.size}, min={vals.min()}, max={vals.max()}, head=[{head}{'' if vals.size<=5 else ', …'}]"
+
+    logger.debug(
+        (
+            f"J_exact: ℓ {_ell_summary(ell_arr)} | s_method={str(method)} | nodes={int(nodes)} "
+            f"| ecc_tol={float(ecc_tol):.2e} | a_in={float(a_inner):.6g} | a_out={float(a_outer):.6g}"
+        )
+    )
+
     values = s_val * (leg0 ** 2) * (a_inner ** ell_arr) / (a_outer ** (ell_arr + 1))
-    return _to_output(values.reshape(ell_arr.shape))
+    out = _to_output(values.reshape(ell_arr.shape))
+    logger.debug(f"J_exact: done | output.shape={np.shape(out)}")
+    return out
 
 
 def J_series(
@@ -196,13 +278,31 @@ def J_series(
     N_overlap: int = 200,
     ecc_tol: float = 1.0e-3,
 ) -> np.ndarray:
-    """Return geometry-only ``J_{ijℓ}`` for multipole indices ``ℓ``."""
+    """Return geometry-only ``J_{ijℓ}`` for multipole indices ``ℓ``.
+
+    Debug logging:
+    - Logs requested ℓ entries and whether ``s_ijl`` is used or not.
+    - Logs derived even-degree indices ``L = 2ℓ`` and output shape.
+    """
 
     ell_arr = np.asarray(ells, dtype=int)
     if ell_arr.size == 0:
         return np.asarray(ell_arr, dtype=float)
 
     L_arr = even_ells(ell_arr)
+
+    def _ell_summary(vals: np.ndarray) -> str:
+        vals = np.asarray(vals).reshape(-1)
+        head = ", ".join(map(str, vals[:5]))
+        return f"size={vals.size}, min={vals.min()}, max={vals.max()}, head=[{head}{'' if vals.size<=5 else ', …'}]"
+
+    logger.debug(
+        (
+            f"J_series: ℓ {_ell_summary(ell_arr)} | use_sijl={bool(use_sijl)} | s_method={str(s_method)} "
+            f"| N_overlap={int(N_overlap)} | ecc_tol={float(ecc_tol):.2e} | "
+            f"L_range=[{int(L_arr.min()) if L_arr.size else '-'}..{int(L_arr.max()) if L_arr.size else '-'}]"
+        )
+    )
 
     if not use_sijl:
         s_vals = np.ones_like(ell_arr, dtype=float)
@@ -225,7 +325,91 @@ def J_series(
         )
 
     geom = np.asarray(geom, dtype=float).reshape(ell_arr.shape)
+    logger.debug(f"J_series: done | output.shape={np.shape(geom)}")
     return geom
+
+
+def timed_J_series(
+    pair: OrbitPair,
+    ells: Sequence[int],
+    *,
+    use_sijl: bool = True,
+    s_method: str = "auto",
+    N_overlap: int = 200,
+    ecc_tol: float = 1.0e-3,
+) -> np.ndarray:
+    """Timed wrapper for :func:`J_series` that logs elapsed time at DEBUG level.
+
+    Returns the same geometry-only array as :func:`J_series` while emitting a
+    timing summary that includes key configuration parameters.
+    """
+
+    t0 = perf_counter()
+    out = J_series(
+        pair,
+        ells,
+        use_sijl=use_sijl,
+        s_method=s_method,
+        N_overlap=N_overlap,
+        ecc_tol=ecc_tol,
+    )
+    dt = perf_counter() - t0
+
+    ell_arr = np.asarray(ells, dtype=int)
+    def _ell_summary(vals: np.ndarray) -> str:
+        vals = np.asarray(vals).reshape(-1)
+        head = ", ".join(map(str, vals[:5]))
+        return f"size={vals.size}, min={vals.min()}, max={vals.max()}, head=[{head}{'' if vals.size<=5 else ', …'}]"
+
+    logger.debug(
+        (
+            f"timed_J_series: {dt*1e3:.3f} ms | ℓ {_ell_summary(ell_arr)} | "
+            f"use_sijl={bool(use_sijl)} | s_method={str(s_method)} | N_overlap={int(N_overlap)} | "
+            f"ecc_tol={float(ecc_tol):.2e} | out.shape={np.shape(out)}"
+        )
+    )
+    return out
+
+def timed_J_ijl(
+    pair: OrbitPair,
+    ell: int | np.ndarray,
+    *,
+    method: str = "auto",
+    nodes: int = 200,
+    ecc_tol: float = 1.0e-3,
+) -> float | np.ndarray:
+    """Timed wrapper for :func:`J_exact` that logs elapsed evaluation time.
+
+    Parameters
+    ----------
+    pair
+        The interacting :class:`~vrr.orbits.OrbitPair`.
+    ell
+        Multipole index/indices for which to compute ``J_{ijℓ}``.
+    method, nodes, ecc_tol
+        Passed directly to :func:`J_exact` / :func:`s_ijl`.
+
+    Returns
+    -------
+    float | np.ndarray
+        The same output as :func:`J_exact`.
+
+    Notes
+    -----
+    Emits a debug log with the total wall-clock time using
+    :func:`time.perf_counter`.
+    """
+
+    t0 = perf_counter()
+    out = J_exact(pair, ell, method=method, nodes=nodes, ecc_tol=ecc_tol)
+    dt = perf_counter() - t0
+
+    # Avoid large array printing
+    shape = np.shape(out)
+    logger.debug(
+        f"timed_J_ijl: J_exact took {dt * 1e3:.3f} ms | output.shape={shape} | method={str(method)} | nodes={int(nodes)}"
+    )
+    return out
 
 
 def H_terms(ells: Sequence[int], J_ell: np.ndarray, cos_theta: float) -> np.ndarray:
@@ -381,6 +565,7 @@ __all__ = [
     "s_ijl",
     "J_exact",
     "J_series",
+    "timed_J_ijl",
     "H_terms",
     "Omega_terms",
     "H_partial_sums",
