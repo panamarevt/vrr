@@ -20,7 +20,15 @@ transition gradually while benefiting from the clearer layout."""
 from __future__ import annotations
 
 from .orbits import Orbit, OrbitPair
-from .geometry import H_partial_sums, J_exact, J_series, Omega_partial_sums, s_ijl
+from .geometry import (
+    H_partial_sums,
+    J_exact,
+    J_series,
+    Omega_partial_sums,
+    s_ijl,
+    timed_J_ijl,
+    timed_J_series,
+)
 from .kernels import (
     I2_from_orbits,
     I2_from_pair,
@@ -65,6 +73,8 @@ __all__ = [
     "J_exact",
     "J_series",
     "s_ijl",
+    "timed_J_ijl",
+    "timed_J_series",
     "H_partial_sums",
     "Omega_partial_sums",
     "even_ells",

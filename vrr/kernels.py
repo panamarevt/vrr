@@ -12,6 +12,20 @@ from .legendre import even_ells, legendre_P_derivative
 from .orbits import OrbitPair, _build_pair, _radii_sorted
 from .geometry import Omega_partial_sums
 
+# Prefer loguru's logger; fall back gracefully to stdlib logging
+try:  # pragma: no cover - trivial import guard
+    from loguru import logger  # type: ignore
+except Exception:  # pragma: no cover - fallback path
+    import logging as _logging
+
+    logger = _logging.getLogger("vrr.kernels")
+    if not logger.handlers:
+        _handler = _logging.StreamHandler()
+        _formatter = _logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+        _handler.setFormatter(_formatter)
+        logger.addHandler(_handler)
+    logger.setLevel(_logging.DEBUG)
+
 
 @dataclass
 class AsymptoticMetadata:
@@ -278,12 +292,31 @@ def omega_hybrid_from_meta(
 
 
 def I2_numeric(a: float, b: float, c: float, d: float) -> float:
-    """Evaluate the integral ``I_2`` for overlapping eccentric annuli."""
+    """Evaluate the integral ``I_2`` for overlapping eccentric annuli.
+
+    Emits DEBUG logs with inputs and elapsed time. Uses fixed tolerances
+    (epsabs=1e-9, epsrel=1e-9) currently.
+    """
+
+    from time import perf_counter
+
+    logger.debug(
+        (
+            f"I2_numeric: start | a={float(a):.6g}, b={float(b):.6g}, c={float(c):.6g}, d={float(d):.6g}"
+        )
+    )
+    t0 = perf_counter()
+    # Handle touching annuli (b≈c) with analytic limit to avoid 0/0 roundoff
+    if abs(b - c) <= 1.0e-12 * max(d, 1.0):
+        denom = np.sqrt(max((b - a) * (d - b), 1.0e-300))
+        val = float(np.pi * (b * b) / denom)
+        dt = perf_counter() - t0
+        logger.debug(
+            f"I2_numeric: touching limit (b≈c) | value={val:.6g} | {dt*1e3:.2f} ms"
+        )
+        return val
 
     if not (a < b <= c < d):
-        if abs(b - c) <= 1.0e-12 * max(d, 1.0):
-            denom = np.sqrt(max((b - a) * (d - b), 1.0e-300))
-            return float(np.pi * (b * b) / denom)
         raise ValueError(f"Bad ordering in I2 integral: {a}, {b}, {c}, {d}")
 
     midpoint = 0.5 * (b + c)
@@ -303,6 +336,8 @@ def I2_numeric(a: float, b: float, c: float, d: float) -> float:
         return (r * r) * dr / denominator
 
     val, _ = quad(integrand, -np.pi / 2.0, np.pi / 2.0, epsabs=1.0e-9, epsrel=1.0e-9, limit=200)
+    dt = perf_counter() - t0
+    logger.debug(f"I2_numeric: done | value={float(val):.6g} | {dt*1e3:.2f} ms")
     return float(val)
 
 
@@ -322,16 +357,48 @@ def I2_from_orbits(a_i: float, e_i: float, a_j: float, e_j: float, *, nodes: int
 
 
 def Jbar_ecc_nonoverlap(pair: OrbitPair) -> float:
-    """Return the geometry-only non-overlap asymptotic coupling ``\bar{J}``."""
+    """Return the geometry-only non-overlap asymptotic coupling ``\bar{J}``.
+
+    Cached per-pair in the orbit's geometry cache to avoid recomputation.
+    Logs inputs and value at DEBUG only on first compute (cache miss).
+    """
+
+    cache_key = ("Jbar_non_overlap",)
+    if hasattr(pair, "_geometry_cache") and cache_key in pair._geometry_cache:  # type: ignore[attr-defined]
+        return float(pair._geometry_cache[cache_key][0])  # type: ignore[index]
+
+    from time import perf_counter
+    t0 = perf_counter()
 
     inner, outer = pair.inner, pair.outer
     ratio = ((1.0 + inner.e) * (1.0 - outer.e)) ** 1.5
     denom = np.sqrt(max(inner.e * outer.e, 1.0e-300))
-    return float(ratio / (np.pi ** 2 * denom * outer.periapsis))
+    value = float(ratio / (np.pi ** 2 * denom * outer.periapsis))
+    if hasattr(pair, "_geometry_cache"):
+        pair._geometry_cache[cache_key] = np.array([value], dtype=float)  # type: ignore[attr-defined]
+    dt = perf_counter() - t0
+    logger.debug(
+        (
+            f"Jbar_ecc_nonoverlap: a_in={inner.a:.6g}, e_in={inner.e:.3g} | a_out={outer.a:.6g}, e_out={outer.e:.3g} | "
+            f"Jbar={value:.6g} | {dt*1e3:.2f} ms"
+        )
+    )
+    return value
 
 
 def Jbar_ecc_overlap(pair: OrbitPair) -> float:
-    """Return the geometry-only overlapping asymptotic coupling ``\bar{J}``."""
+    """Return the geometry-only overlapping asymptotic coupling ``\bar{J}``.
+
+    Cached per-pair in the orbit's geometry cache to avoid recomputation.
+    Logs the I2 value and Jbar only on first compute (cache miss).
+    """
+
+    cache_key = ("Jbar_overlap",)
+    if hasattr(pair, "_geometry_cache") and cache_key in pair._geometry_cache:  # type: ignore[attr-defined]
+        return float(pair._geometry_cache[cache_key][0])  # type: ignore[index]
+
+    from time import perf_counter
+    t0 = perf_counter()
 
     inner, outer = pair.inner, pair.outer
     a = min(inner.periapsis, outer.periapsis)
@@ -339,7 +406,17 @@ def Jbar_ecc_overlap(pair: OrbitPair) -> float:
     c = min(inner.apoapsis, outer.apoapsis)
     d = max(inner.apoapsis, outer.apoapsis)
     integral = I2_numeric(a, b, c, d)
-    return float(4.0 * integral / (np.pi ** 3 * inner.a * outer.a))
+    value = float(4.0 * integral / (np.pi ** 3 * inner.a * outer.a))
+    if hasattr(pair, "_geometry_cache"):
+        pair._geometry_cache[cache_key] = np.array([value], dtype=float)  # type: ignore[attr-defined]
+    dt = perf_counter() - t0
+    logger.debug(
+        (
+            f"Jbar_ecc_overlap: a_in={inner.a:.6g}, e_in={inner.e:.3g} | a_out={outer.a:.6g}, e_out={outer.e:.3g} | "
+            f"I2={integral:.6g} | Jbar={value:.6g} | {dt*1e3:.2f} ms"
+        )
+    )
+    return value
 
 
 def _omega_kernel_both_circular(
@@ -388,7 +465,14 @@ def _omega_kernel_non_overlap(
     """Return the analytic ``Ω`` kernel for eccentric non-overlapping orbits."""
 
     z = float(pair.z_parameter)
-    J_bar_geom = Jbar_ecc_nonoverlap(pair)
+    # Cache non-overlap Jbar to avoid recomputation per-ℓ
+    cache_key = ("Jbar_non_overlap",)
+    if not hasattr(pair, "_geometry_cache") or cache_key not in pair._geometry_cache:  # type: ignore[attr-defined]
+        J_bar_geom = Jbar_ecc_nonoverlap(pair)
+        if hasattr(pair, "_geometry_cache"):
+            pair._geometry_cache[cache_key] = np.array([J_bar_geom], dtype=float)  # type: ignore[attr-defined]
+    else:  # pragma: no cover - cache hit
+        J_bar_geom = float(pair._geometry_cache[cache_key][0])  # type: ignore[index]
     omega_orb = pair.orbital_frequency_primary
     L_i = max(pair.angular_momentum_primary, 1.0e-300)
     denom = max(L_i * omega_orb, 1.0e-300)
@@ -400,8 +484,14 @@ def _omega_kernel_overlap(
     pair: OrbitPair, x: float, tag: Optional[str] = None
 ) -> float:
     """Return the analytic ``Ω`` kernel for overlapping or embedded orbits."""
-
-    J_bar_geom = Jbar_ecc_overlap(pair)
+    # Reuse cached Jbar if available to avoid recomputing I2 multiple times
+    cache_key = ("Jbar_overlap",)
+    if not hasattr(pair, "_geometry_cache") or cache_key not in pair._geometry_cache:  # type: ignore[attr-defined]
+        J_bar_geom = Jbar_ecc_overlap(pair)
+        if hasattr(pair, "_geometry_cache"):
+            pair._geometry_cache[cache_key] = np.array([J_bar_geom], dtype=float)  # type: ignore[attr-defined]
+    else:  # pragma: no cover - simple cache hit path
+        J_bar_geom = float(pair._geometry_cache[cache_key][0])  # type: ignore[index]
     omega_orb = pair.orbital_frequency_primary
     L_i = max(pair.angular_momentum_primary, 1.0e-300)
     denom = max(L_i * omega_orb, 1.0e-300)
@@ -470,7 +560,13 @@ def _hamiltonian_kernel_non_overlap(
 
     del tag
     z = float(pair.z_parameter)
-    J_bar_geom = Jbar_ecc_nonoverlap(pair)
+    cache_key = ("Jbar_non_overlap",)
+    if not hasattr(pair, "_geometry_cache") or cache_key not in pair._geometry_cache:  # type: ignore[attr-defined]
+        J_bar_geom = Jbar_ecc_nonoverlap(pair)
+        if hasattr(pair, "_geometry_cache"):
+            pair._geometry_cache[cache_key] = np.array([J_bar_geom], dtype=float)  # type: ignore[attr-defined]
+    else:  # pragma: no cover - cache hit
+        J_bar_geom = float(pair._geometry_cache[cache_key][0])  # type: ignore[index]
     S_geom = S_ecc_kernel(float(x), z, epsabs=quad_epsabs, epsrel=quad_epsrel)
     return pair.mass_prefactor() * J_bar_geom * S_geom
 
@@ -486,7 +582,13 @@ def _hamiltonian_kernel_overlap(
 
     del quad_epsabs, quad_epsrel
     del tag
-    J_bar_geom = Jbar_ecc_overlap(pair)
+    cache_key = ("Jbar_overlap",)
+    if not hasattr(pair, "_geometry_cache") or cache_key not in pair._geometry_cache:  # type: ignore[attr-defined]
+        J_bar_geom = Jbar_ecc_overlap(pair)
+        if hasattr(pair, "_geometry_cache"):
+            pair._geometry_cache[cache_key] = np.array([J_bar_geom], dtype=float)  # type: ignore[attr-defined]
+    else:  # pragma: no cover - cache hit
+        J_bar_geom = float(pair._geometry_cache[cache_key][0])  # type: ignore[index]
     S_geom = S_overlap_kernel(float(x))
     return 0.5 * pair.mass_prefactor() * J_bar_geom * S_geom
 

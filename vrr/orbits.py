@@ -1,9 +1,6 @@
 """Orbit data structures and helpers for vector resonant relaxation."""
 
 from __future__ import annotations
-"""Orbit data structures and helpers for vector resonant relaxation."""
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
